@@ -1,0 +1,156 @@
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================
+# 虚拟环境
+# ============================================
+venv/
+ENV/
+env/
+.venv/
+.env/
+autocoder/          # ← 如果你的 conda 环境也叫这个名，可能需要删除这行
+.conda/
+conda-meta/
+
+# ============================================
+# 环境变量与密钥（⚠️ 重要：防止泄露 API Key）
+# ============================================
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets.json
+credentials.json
+
+# ============================================
+# IDE / 编辑器
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-project
+*.sublime-workspace
+
+# ============================================
+# Jupyter / IPython
+# ============================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ============================================
+# 测试与覆盖率
+# ============================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# ============================================
+# 类型检查
+# ============================================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# ============================================
+# 日志与临时文件
+# ============================================
+*.log
+logs/
+*.tmp
+*.bak
+*.cache
+*.pid
+
+# ============================================
+# AutoCoder 项目专属
+# ============================================
+workspace/              # Agent 操作的工作目录（用户文件，不应提交）
+sessions/               # 会话历史（如果有持久化）
+*.db                    # SQLite / ChromaDB 数据库文件
+chroma_db/              # ChromaDB 持久化目录
+*.sqlite
+*.sqlite3
+checkpoints/            # MemorySaver checkpoint
+memory/                 # LangGraph 持久化
+output/                 # 运行产出
+
+# ============================================
+# 模型与大文件
+# ============================================
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.h5
+models/
+weights/
+
+# ============================================
+# 文档构建产物
+# ============================================
+docs/_build/
+site/
+_site/
+
+# ============================================
+# 操作系统
+# ============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ============================================
+# Node.js（如果未来加 Web UI）
+# ============================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

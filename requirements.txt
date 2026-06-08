@@ -1,0 +1,9 @@
+langchain>=0.3.0
+langchain-openai
+langgraph>=0.2.0
+mcp>=1.0.0
+python-dotenv
+rich
+duckduckgo-search
+chromadb
+tiktoken

@@ -1,0 +1,90 @@
+{
+  "_comment": "AutoCoder Hook 规则配置。借鉴 Claude Code hookify 的声明式格式。",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "name": "block-rm-rf",
+        "matcher": "mcp_execute_bash",
+        "action": "block",
+        "message": "Dangerous 'rm -rf' command is blocked on this system. Use 'del /f /q' on Windows or 'rm -f <file>' for single files.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "command",
+            "operator": "regex_match",
+            "pattern": "rm\\s+-rf"
+          }
+        ]
+      },
+      {
+        "name": "block-format-disk",
+        "matcher": "mcp_execute_bash",
+        "action": "block",
+        "message": "Disk format command is blocked by policy.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "command",
+            "operator": "regex_match",
+            "pattern": "format\\s+[A-Za-z]:"
+          }
+        ]
+      },
+      {
+        "name": "block-interactive-commands",
+        "matcher": "mcp_execute_bash",
+        "action": "block",
+        "message": "Interactive commands (vim/nano/top/less) are blocked. Use mcp_read_file/mcp_write_file instead.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "command",
+            "operator": "regex_match",
+            "pattern": "^\\s*(vim|nano|top|less|more|htop)\\s"
+          }
+        ]
+      },
+      {
+        "name": "warn-sensitive-files",
+        "matcher": "mcp_write_file",
+        "action": "warn",
+        "message": "Writing to a sensitive file. Ensure no credentials are hardcoded.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "file_path",
+            "operator": "regex_match",
+            "pattern": "\\.env$|\\.env\\.|credentials|secrets|\\.pem$|\\.key$"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "name": "log-file-write",
+        "matcher": "mcp_write_file",
+        "action": "log",
+        "message": "File write completed.",
+        "enabled": true,
+        "conditions": []
+      },
+      {
+        "name": "log-patch-apply",
+        "matcher": "mcp_apply_patch",
+        "action": "log",
+        "message": "Patch applied.",
+        "enabled": true,
+        "conditions": []
+      },
+      {
+        "name": "confirm-before-delete",
+        "matcher": "mcp_delete_file",
+        "action": "warn",
+        "message": "⚠️ 即将执行文件删除操作。请确保用户已明确确认后再执行。",
+        "enabled": true,
+        "conditions": []
+        }
+    ],
+    "Stop": []
+  }
+}
