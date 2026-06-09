@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+import platform
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -9,12 +10,24 @@ mcp = FastMCP("AutoCoder-Engine")
 
 WORKSPACE_DIR = Path(os.getenv("AUTOCODER_WORKSPACE", os.getcwd())).resolve()
 
+# 借鉴 Codex _sandbox.py：3 级沙箱
+# read_only / workspace_write / full_access
+SANDBOX_MODE = os.getenv("AUTOCODER_SANDBOX", "workspace_write")
+
 
 def _resolve(path: str) -> Path:
+    """解析路径并做沙箱检查。"""
     target = (WORKSPACE_DIR / path).resolve()
     if not str(target).startswith(str(WORKSPACE_DIR)):
         raise ValueError(f"Access denied: Path {path} is outside workspace {WORKSPACE_DIR}")
     return target
+
+
+def _check_write_permission() -> str | None:
+    """检查写权限。返回错误信息或 None（允许）。"""
+    if SANDBOX_MODE == "read_only":
+        return "Error: Sandbox is in read-only mode. Write operations are disabled. Set AUTOCODER_SANDBOX=workspace_write in .env to enable."
+    return None
 
 
 @mcp.tool()
@@ -27,10 +40,10 @@ def list_dir(directory: str = ".") -> str:
 
         items = []
         for p in target.iterdir():
-            if p.name.startswith('.') or p.name in ['node_modules', '__pycache__', 'venv']:
+            if p.name.startswith('.') or p.name in ['node_modules', '__pycache__', 'venv', '.git']:
                 continue
             items.append(f"[{'DIR' if p.is_dir() else 'FILE'}] {p.name}")
-        return "\n".join(items) if items else "Empty directory."
+        return "\n".join(sorted(items)) if items else "Empty directory."
     except Exception as e:
         return f"Error: {e}"
 
@@ -40,11 +53,16 @@ def read_file(file_path: str, start_line: int = 1, end_line: int = None) -> str:
     """Read file with line numbers."""
     try:
         target = _resolve(file_path)
+        if not target.exists():
+            return f"Error: File not found: {file_path}"
         with open(target, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
         end = min(end_line, len(lines)) if end_line else len(lines)
-        return "".join(f"{i+1:4d} | {lines[i]}" for i in range(start_line-1, end))
+        start = max(1, start_line)
+        return "".join(f"{i+1:4d} | {lines[i]}" for i in range(start-1, end))
+    except UnicodeDecodeError:
+        return f"Error: {file_path} is not a text file (binary content)"
     except Exception as e:
         return f"Error: {e}"
 
@@ -58,14 +76,16 @@ def search_files(regex: str, file_pattern: str = "*.*") -> str:
         for path in WORKSPACE_DIR.rglob(file_pattern):
             if any(part.startswith('.') for part in path.parts) or not path.is_file():
                 continue
+            if path.name in ['node_modules', '__pycache__', 'venv']:
+                continue
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     for i, line in enumerate(f, 1):
                         if pattern.search(line):
                             results.append(f"{path.relative_to(WORKSPACE_DIR)}:{i}: {line.strip()}")
                             if len(results) > 100:
-                                return "\n".join(results) + "\n...[Too many results]"
-            except UnicodeDecodeError:
+                                return "\n".join(results) + "\n...[Too many results, showing first 100]"
+            except (UnicodeDecodeError, PermissionError):
                 pass
     except re.error as e:
         return f"Regex Compilation Error: {e}"
@@ -76,19 +96,34 @@ def search_files(regex: str, file_pattern: str = "*.*") -> str:
 def execute_bash(command: str, timeout: int = 60) -> str:
     """Execute a shell command safely."""
     if re.search(r"^\s*(vim|nano|top|less|more|htop)", command):
-        return "Error: Interactive commands blocked."
+        return "Error: Interactive commands blocked. Use read_file/write_file instead."
+
+    # 只读模式下阻止写操作命令
+    if SANDBOX_MODE == "read_only":
+        write_patterns = r"(^|\s)(rm|del|move|mv|cp|mkdir|rmdir|touch|>|>>|tee)\s"
+        if re.search(write_patterns, command):
+            return "Error: Sandbox is in read-only mode. Destructive/write commands are disabled."
+
+    # 借鉴 autocoder/shell/detect.py：根据平台选择 shell
+    if platform.system() == "Windows":
+        shell_executable = None
+    else:
+        shell_executable = "/bin/bash"
 
     try:
         res = subprocess.run(
             command, shell=True, cwd=WORKSPACE_DIR,
-            capture_output=True, text=True, timeout=timeout
+            capture_output=True, text=True, timeout=timeout,
+            executable=shell_executable,
         )
         out = f"Exit Code: {res.returncode}\n"
         if res.stdout:
-            out += f"--- STDOUT ---\n{res.stdout[:2000]}\n"
+            out += f"--- STDOUT ---\n{res.stdout[:3000]}\n"
         if res.stderr:
             out += f"--- STDERR ---\n{res.stderr[:2000]}\n"
         return out
+    except subprocess.TimeoutExpired:
+        return f"Error: Command timed out after {timeout} seconds."
     except Exception as e:
         return f"Command execution failed: {e}"
 
@@ -96,11 +131,14 @@ def execute_bash(command: str, timeout: int = 60) -> str:
 @mcp.tool()
 def write_file(file_path: str, content: str) -> str:
     """Write content to a file (creates parent dirs)."""
+    write_err = _check_write_permission()
+    if write_err:
+        return write_err
     try:
         target = _resolve(file_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding='utf-8')
-        return f"Success: Written {file_path} ({len(content)} bytes)"
+        return f"Success: Written {file_path} ({len(content)} bytes, {content.count(chr(10))+1} lines)"
     except Exception as e:
         return f"Error: {e}"
 
@@ -108,6 +146,9 @@ def write_file(file_path: str, content: str) -> str:
 @mcp.tool()
 def apply_patch(file_path: str, original: str, replacement: str) -> str:
     """Apply a targeted patch: replace an exact string in a file."""
+    write_err = _check_write_permission()
+    if write_err:
+        return write_err
     try:
         target = _resolve(file_path)
         if not target.exists():
@@ -139,9 +180,13 @@ def apply_patch(file_path: str, original: str, replacement: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 @mcp.tool()
 def delete_file(file_path: str) -> str:
     """Delete a file in the workspace."""
+    write_err = _check_write_permission()
+    if write_err:
+        return write_err
     try:
         target = _resolve(file_path)
         if not target.exists():
@@ -153,6 +198,7 @@ def delete_file(file_path: str) -> str:
         return f"Success: Deleted file {file_path}"
     except Exception as e:
         return f"Error: {e}"
+
 
 if __name__ == "__main__":
     mcp.run(transport='stdio')

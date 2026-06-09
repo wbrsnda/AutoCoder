@@ -172,7 +172,6 @@ async def main():
             architect_llm=architect_llm,
             coder_llm=coder_llm,
             mcp_tools=mcp_tools,
-            orchestrator=None,           # 已移除 ToolOrchestrator
             hook_engine=hook_engine,
             rag_tool=rag_search,
             max_tool_calls_per_turn=15,
@@ -205,6 +204,7 @@ async def main():
                     "current_role": "architect",
                     "delegation": "",
                     "budget_exhausted": False,
+                    "latest_tool_results": [],
                 }
 
                 async for _ in graph.astream(state, config=config):

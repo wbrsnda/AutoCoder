@@ -1,125 +1,187 @@
 # AutoCoder 🤖
 
-> 基于 LangGraph 的双 Agent 代码协作系统 | A LangGraph-based Dual-Agent Code Assistant
+> 基于 LangGraph 的确定性双 Agent 代码协作系统
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org)
 [![LangGraph](https://img.shields.io/badge/LangGraph-0.2+-orange.svg)](https://github.com/langchain-ai/langgraph)
 [![MCP](https://img.shields.io/badge/MCP-1.0+-green.svg)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
----
-
-## ✨ 项目亮点
-
-AutoCoder 是一个**本地化的多 Agent 代码协作系统**，借鉴 [Claude Code](https://www.anthropic.com/claude-code) 和 [OpenAI Codex](https://openai.com/codex) 的核心设计思想，采用 **Architect-Coder 双角色架构**：
-
-- 🏛️ **Architect Agent**：负责任务规划与拆解
-- 💻 **Coder Agent**：负责工具调用与代码执行
-- 🔧 **MCP Server**：通过 Model Context Protocol 协议封装文件系统、Shell、代码搜索等工具
-- 🛡️ **Hook 安全引擎**：声明式 JSON 规则系统，对危险操作三级防护（block / warn / log）
-- 🧠 **历史压缩**：渐进式摘要 + 长消息截断，避免 token 浪费
-- ⚡ **本地优先**：支持 Ollama、vLLM 等本地 LLM，也兼容 OpenAI API
+借鉴 [Claude Code](https://www.anthropic.com/claude-code) 与 [OpenAI Codex](https://openai.com/codex) 的工程化设计，本地优先、零数据外泄。
 
 ---
 
-## 🏗️ 架构图
-┌─────────────────────────────────────────────┐
-│ User Input │
-└──────────────────┬──────────────────────────┘
-▼
-┌──────────────────┐
-│ Architect │ ← 规划 / 拆解 / 决策
-│ (high temp 0.1) │
-└──────────┬───────┘
-│ DELEGATE TO CODER
-▼
-┌──────────────────┐
-│ Coder │ ← 工具调用 / 执行
-│ (zero temp 0.0) │
-└──────────┬───────┘
-│ tool_calls
-▼
-┌──────────────────┐ ┌─────────────┐
-│ Hook Engine │ ───→│ MCP Server │
-│ (pre/post check) │ │ (7 tools) │
-└──────────┬───────┘ └─────────────┘
-│ tool results
-▼
-┌──────────────────┐
-│ Budget Control │ ← 死循环检测 / 调用上限
-└──────────┬───────┘
-│
-└──→ Loop back to Coder / Architect
+## ✨ 核心特性
+
+- **三阶段状态机**：Architect 规划 → Coder 执行 → Reporter 解析，物理阻断工具循环
+- **确定性代码分析**：Python AST 解析真实类/函数/行号，告别 LLM 幻觉
+- **企业级安全**：PreToolUse 拦截 `rm -rf` / `eval()` / `pickle.load()`，三级沙箱隔离
+- **Turn 隔离**：每轮工具结果独立作用域，杜绝上下文污染
+- **本地优先**：支持 Ollama / vLLM / LM Studio，兼容 OpenAI API
+
+---
+
+## 🏗️ 架构
+
+```
+User Input
+    ↓
+🏛️ Architect  ──→ 规划 / 确认 / 最终回答（不调工具）
+    ↓ DELEGATE
+💻 Coder      ──→ 单次工具调用（绑定 tools）
+    ↓ tool_calls
+🛡️ Hook Engine ──→ 危险操作拦截 / 安全扫描
+    ↓
+🔧 MCP Server ──→ 7 个沙箱工具
+    ↓ ToolMessage
+📋 Reporter   ──→ AST 解析 + 结构化报告（不绑定 tools）
+    ↓
+🏛️ Architect  ──→ 基于报告组织回答
+```
 
 ---
 
 ## 🚀 快速开始
 
-### 环境要求
-
-- Python 3.10+
-- Ollama（推荐）或任意 OpenAI 兼容的 LLM 服务
-
-### 安装
-
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/wbrsnda/AutoCoder.git
+# 1. 安装
+git clone https://github.com/yourusername/AutoCoder.git
 cd AutoCoder
-
-# 2. 创建虚拟环境
-python -m venv venv
-source venv/bin/activate    # Linux/Mac
-venv\Scripts\activate       # Windows
-
-# 3. 安装依赖
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 4. 配置环境变量
+# 2. 配置
 cp .env.example .env
-# 编辑 .env，填入你的 LLM 配置
-# 可使用本地 Ollama
+# 编辑 .env
+
+# 3. 运行
+python -m autocoder.main
+```
+
+### .env 配置
+
+```env
+# Ollama 本地（推荐）
 LLM_BASE_URL=http://localhost:11434/v1
 LLM_API_KEY=ollama
-ARCHITECT_MODEL=gemma4
-CODER_MODEL=gemma4
+ARCHITECT_MODEL=qwen2.5-coder:7b
+CODER_MODEL=qwen2.5-coder:7b
 
-# 或使用 OpenAI
+# 或 OpenAI
 # LLM_BASE_URL=https://api.openai.com/v1
 # LLM_API_KEY=sk-xxx
 # ARCHITECT_MODEL=gpt-4o
 # CODER_MODEL=gpt-4o-mini
 
-# 工作目录（Agent 只能操作此目录）
+# 工作目录（沙箱）
 WORKSPACE_DIR=./workspace
+AUTOCODER_SANDBOX=workspace_write   # read_only | workspace_write | full_access
+```
 
-#运行
-python -m autocoder.main
+---
 
+## 🎯 使用示例
 
-#使用示例
-🚀 AutoCoder v4 Starting...
-✅ Ready. Workspace: ./workspace
+### 代码分析（AST 驱动，非 LLM 幻觉）
 
-🧑 You: 列出工作目录有什么文件，告诉我每个文件的作用
+```text
+🧑 You: 分析 train.py 的核心逻辑
 
-🏛️  Architect:
-DELEGATE TO CODER: Read files using mcp_list_dir to explore the workspace.
+📋 Reporter (AST):
+- 类: L102 VideoMAERepCountDataset_Density, L231 StrongDensityTransformer
+- 函数: L297 train(), L269 evaluate()
+- 训练循环: L316-L357 (zero_grad, backward, step)
+- 保存: L377 torch.save
 
-💻 Coder:
-🛠️  Tools: ['mcp_list_dir']
+🏛️ Architect:
+该文件包含训练入口 train()，核心模型是 StrongDensityTransformer
+（基于 TransformerEncoder），使用 Adam + MSELoss 优化...
+```
 
-📋 Result: [DIR] src, [FILE] config.py, [FILE] utils.py
+### 安全删除（PreToolUse 确认）
 
-🏛️  Architect:
-DELEGATE TO CODER: Read files config.py, utils.py simultaneously.
+```text
+🧑 You: 删除 temp.log
 
-💻 Coder:
-🛠️  Tools: ['mcp_read_file', 'mcp_read_file']
+🏛️ Architect:
+是否确认删除该文件？请回复 YES 或 NO
 
-🏛️  Architect:
-工作目录包含 2 个文件和 1 个目录：
-- config.py: 项目全局配置...
-- utils.py: 工具函数库...
+🧑 You: YES
 
-AWAITING USER INPUT
+⚠️ [Hook] Warning: File deletion requested
+✅ Success: Deleted temp.log
+```
+
+---
+
+## 🛡️ 安全机制
+
+### Hook 规则 (`plugins/hooks.json`)
+
+```json
+{
+  "PreToolUse": [
+    {
+      "name": "block-rm-rf",
+      "matcher": "mcp_execute_bash",
+      "action": "block",
+      "conditions": [
+        {"field": "command", "operator": "regex_match", "pattern": "rm\\s+-rf"}
+      ]
+    },
+    {
+      "name": "warn-eval",
+      "matcher": "mcp_write_file",
+      "action": "warn",
+      "conditions": [
+        {"field": "content", "operator": "regex_match", "pattern": "(?<![a-zA-Z0-9_.])eval\\("}
+      ]
+    }
+  ]
+}
+```
+
+支持 `block` / `warn` / `log` 三级响应，覆盖 `eval` / `pickle` / `os.system` / `shell=True` / TLS 禁用 / 硬编码密钥等 15+ 规则。
+
+---
+
+## 🔧 设计对比
+
+| 问题 | 传统方案 | AutoCoder |
+|------|---------|-----------|
+| 工具死循环 | prompt 提醒 | **架构阻断**：Reporter 不绑定 tools |
+| 代码幻觉 | LLM 自由总结 | **AST 解析**：真实行号 + 类名 |
+| 上下文污染 | 扫描历史消息 | **Turn 隔离**：仅当前轮工具结果 |
+| 安全滞后 | 事后警告 | **PreToolUse 拦截** |
+
+---
+
+## 📁 项目结构
+
+```
+autocoder/
+├── agent/
+│   ├── state_machine.py    # LangGraph 三阶段状态机
+│   └── prompts.py          # System Prompts
+├── memory/compress.py      # 历史压缩
+├── orchestrator/
+│   ├── hook_engine.py      # 安全规则引擎
+│   └── security_patterns.py
+├── mcp_server/mcp_server.py # MCP 工具服务（7 tools + 沙箱）
+├── plugins/hooks.json      # 声明式安全规则
+└── main.py
+```
+
+---
+
+## 📝 License
+
+MIT License
+
+---
+
+## 🙏 致谢
+
+- [LangGraph](https://github.com/langchain-ai/langgraph) - 状态机框架
+- [MCP](https://modelcontextprotocol.io) - 工具协议标准
+- [Claude Code](https://www.anthropic.com/claude-code) & [OpenAI Codex](https://openai.com/codex) - 设计理念参考

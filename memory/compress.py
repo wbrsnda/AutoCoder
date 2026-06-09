@@ -1,5 +1,5 @@
 """
-历史压缩模块（推荐版本）
+历史压缩模块（单版本，修复重复定义 bug）。
 """
 from langchain_core.messages import (
     AIMessage,
@@ -32,8 +32,8 @@ def truncate_tool_message(msg: ToolMessage) -> ToolMessage:
 async def compress_history(
     messages: list,
     llm,
-    threshold: int = 60,
-    keep_recent: int = 12,
+    threshold: int = 30,
+    keep_recent: int = 10,
 ) -> list:
     if len(messages) <= threshold:
         return messages
@@ -53,7 +53,12 @@ async def compress_history(
     filtered_old = []
     for m in old_msgs:
         if isinstance(m, ToolMessage):
-            filtered_old.append(truncate_tool_message(m))
+            # 只截断非 read_file 的工具消息
+            # read_file 的内容是 Coder 分析的核心依据，不能截断
+            if "mcp_read_file" in str(m.tool_call_id) or "file_path" in str(m.content)[:50]:
+                filtered_old.append(m)
+            else:
+                filtered_old.append(truncate_tool_message(m))
         else:
             filtered_old.append(m)
 

@@ -254,13 +254,16 @@ class HookEngine:
     def _rule_matches(self, rule: Rule, tool_name: str, context: dict) -> bool:
         """
         检查规则是否匹配。
-        借鉴 rule_engine.py _rule_matches()：ALL conditions 必须满足。
-        无 conditions 的规则不匹配（必须显式声明条件）。
+
+        修复：
+        - 无条件 BLOCK → False（太危险，防误杀）
+        - 无条件 WARN/LOG → True（仅通知，安全）
+        - 有条件 → ALL 条件必须满足
         """
         if not rule.conditions:
-            # 无条件规则：只要事件和 matcher 匹配就触发
-            # 这类规则用于 LOG action（纯日志，无需条件）
-            return rule.action == HookAction.LOG
+            # 无条件 BLOCK 太危险，不允许
+            # 无条件 WARN/LOG 安全，允许触发
+            return rule.action != HookAction.BLOCK
 
         for condition in rule.conditions:
             if not self._check_condition(condition, tool_name, context):

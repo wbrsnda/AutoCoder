@@ -1,12 +1,12 @@
 {
-  "_comment": "AutoCoder Hook 规则配置。借鉴 Claude Code hookify 的声明式格式。",
+  "_comment": "AutoCoder Hook 规则配置，借鉴 Claude Code security-guidance patterns.py",
   "hooks": {
     "PreToolUse": [
       {
         "name": "block-rm-rf",
         "matcher": "mcp_execute_bash",
         "action": "block",
-        "message": "Dangerous 'rm -rf' command is blocked on this system. Use 'del /f /q' on Windows or 'rm -f <file>' for single files.",
+        "message": "Dangerous 'rm -rf' command is blocked. Use mcp_delete_file for single files.",
         "enabled": true,
         "conditions": [
           {
@@ -45,16 +45,114 @@
         ]
       },
       {
+        "name": "block-subprocess-shell-true",
+        "matcher": "mcp_write_file",
+        "action": "warn",
+        "message": "⚠️ Security Warning: subprocess with shell=True enables command injection.\nSAFE: use subprocess.run(['cmd', arg]) with a list, without shell=True.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "content",
+            "operator": "regex_match",
+            "pattern": "subprocess\\.(run|call|Popen|check_output|check_call)\\(.*shell\\s*=\\s*True"
+          }
+        ]
+      },
+      {
+        "name": "block-os-system-injection",
+        "matcher": "mcp_write_file",
+        "action": "warn",
+        "message": "⚠️ Security Warning: os.system() runs a shell and is a command-injection sink.\nSAFE: use subprocess.run(['cmd', arg]) with a list instead.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "content",
+            "operator": "regex_match",
+            "pattern": "\\bos\\.system\\s*\\("
+          }
+        ]
+      },
+      {
+        "name": "warn-eval-injection",
+        "matcher": "mcp_write_file",
+        "action": "warn",
+        "message": "⚠️ Security Warning: eval() executes arbitrary code. Use json.loads() for data or ast.literal_eval() for Python literals instead.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "content",
+            "operator": "regex_match",
+            "pattern": "(?<![a-zA-Z0-9_.])eval\\("
+          }
+        ]
+      },
+      {
+        "name": "warn-pickle-deserialization",
+        "matcher": "mcp_write_file",
+        "action": "warn",
+        "message": "⚠️ Security Warning: pickle.load/loads from untrusted sources allows arbitrary code execution.\nSAFE: use JSON or msgspec for simple data instead.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "content",
+            "operator": "regex_match",
+            "pattern": "(?<![a-zA-Z0-9_])pickle\\.(loads?|Unpickler)\\b"
+          }
+        ]
+      },
+      {
+        "name": "warn-unsafe-yaml-load",
+        "matcher": "mcp_write_file",
+        "action": "warn",
+        "message": "⚠️ Security Warning: yaml.load() can execute arbitrary Python via !!python/object tags.\nSAFE: use yaml.safe_load() instead.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "content",
+            "operator": "regex_match",
+            "pattern": "\\byaml\\.load\\s*\\((?![^)\\n]{0,80}\\bSafe)"
+          }
+        ]
+      },
+      {
+        "name": "warn-tls-verification-disabled",
+        "matcher": "mcp_write_file",
+        "action": "warn",
+        "message": "⚠️ Security Warning: TLS verification is disabled. This allows MITM attacks.\nRemove verify=False and use proper certificates.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "content",
+            "operator": "regex_match",
+            "pattern": "verify\\s*=\\s*False|InsecureSkipVerify\\s*:\\s*true|check_hostname\\s*=\\s*False"
+          }
+        ]
+      },
+      {
         "name": "warn-sensitive-files",
         "matcher": "mcp_write_file",
         "action": "warn",
-        "message": "Writing to a sensitive file. Ensure no credentials are hardcoded.",
+        "message": "⚠️ Writing to a sensitive file. Ensure no credentials are hardcoded.",
         "enabled": true,
         "conditions": [
           {
             "field": "file_path",
             "operator": "regex_match",
             "pattern": "\\.env$|\\.env\\.|credentials|secrets|\\.pem$|\\.key$"
+          }
+        ]
+      },
+      {
+        "name": "warn-hardcoded-secrets",
+        "matcher": "mcp_write_file",
+        "action": "warn",
+        "message": "⚠️ Security Warning: Possible hardcoded secret detected (password/token/api_key assignment).\nUse environment variables or a secrets manager instead.",
+        "enabled": true,
+        "conditions": [
+          {
+            "field": "content",
+            "operator": "regex_match",
+            "pattern": "(password|passwd|secret|api_key|token|auth_key)\\s*=\\s*['\"][^'\"]{6,}['\"]"
           }
         ]
       }
@@ -77,13 +175,21 @@
         "conditions": []
       },
       {
-        "name": "confirm-before-delete",
+        "name": "log-file-delete",
         "matcher": "mcp_delete_file",
-        "action": "warn",
-        "message": "⚠️ 即将执行文件删除操作。请确保用户已明确确认后再执行。",
+        "action": "log",
+        "message": "File deleted.",
         "enabled": true,
         "conditions": []
-        }
+      },
+      {
+        "name": "warn-before-delete",
+        "matcher": "mcp_delete_file",
+        "action": "warn",
+        "message": "⚠️ File deletion executed. Ensure user has confirmed this action.",
+        "enabled": true,
+        "conditions": []
+      }
     ],
     "Stop": []
   }
