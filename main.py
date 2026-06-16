@@ -1,4 +1,8 @@
 import os
+os.environ["ALLOWED_MSGPACK_MODULES"] = (
+    "autocoder.models.turn:TurnStatus,"
+    "autocoder.models.turn:TurnPhase"
+)
 import sys
 import asyncio
 from pathlib import Path
@@ -20,7 +24,8 @@ from autocoder.rag.retriever import rag_search
 from autocoder.orchestrator.hook_engine import (
     HookEngine, HookEvent, Rule, Condition, HookAction
 )
-
+from autocoder.context.file_tracker import FileTracker
+file_tracker = FileTracker()
 
 async def create_mcp_tools(session):
     @tool
@@ -176,11 +181,31 @@ async def main():
             rag_tool=rag_search,
             max_tool_calls_per_turn=15,
             workspace_dir=str(workspace),
+            file_tracker=file_tracker,   # ← 传入
+            # turn_ctx 由 TaskScheduler 每次新建
         )
 
         config = {"configurable": {"thread_id": "main_session"}}
         print(f"✅ Ready. Workspace: {workspace}")
         print("💡 Enter your request and press Enter. Type 'exit' to quit.\n")
+
+        # ── 引入任务调度层（Codex 风格）────────────────────────
+        from autocoder.tasks import (
+            TaskScheduler, SessionTaskContext, RegularTask, EventBus, TurnAbortReason
+        )
+        from autocoder.models.turn import TurnContext
+
+        config = {"configurable": {"thread_id": "main_session"}}
+        event_bus = EventBus()
+        session_ctx = SessionTaskContext(
+            graph=graph,
+            lang_config=config,
+            event_bus=event_bus,
+        )
+        scheduler = TaskScheduler(session_ctx)
+
+        print(f"✅ Ready. Workspace: {workspace}")
+        print("💡 Enter your request. Ctrl+C to interrupt a running turn. 'exit' to quit.\n")
 
         while True:
             try:
@@ -195,23 +220,33 @@ async def main():
                     continue
 
                 if user_input.lower() in ("exit", "quit", "q"):
+                    await scheduler.abort_all_tasks(TurnAbortReason.REPLACED)
                     print("👋 Goodbye!")
                     break
 
-                state = {
-                    "messages": [HumanMessage(content=user_input)],
-                    "tool_call_count": 0,
-                    "current_role": "architect",
-                    "delegation": "",
-                    "budget_exhausted": False,
-                    "latest_tool_results": [],
-                }
+                # 如果有任务在跑，新输入作为 steering（pending input）
+                if scheduler.is_active:
+                    scheduler.queue_pending_input(user_input)
+                    print("📨 Turn 进行中，已加入待处理队列")
+                    continue
 
-                async for _ in graph.astream(state, config=config):
-                    pass
+                # 创建本次 turn 的上下文
+                ctx = TurnContext(max_tool_calls=15)
+
+                # 启动任务（不阻塞主循环，可被 Ctrl+C 中断）
+                await scheduler.spawn_task(RegularTask(), ctx, user_input)
+
+                # 等待任务完成（同时允许 Ctrl+C 中断）
+                if scheduler._active is not None:
+                    try:
+                        await scheduler._active.done.wait()
+                    except KeyboardInterrupt:
+                        print("\n⚠️  Ctrl+C detected, interrupting current turn...")
+                        await scheduler.abort_all_tasks(TurnAbortReason.INTERRUPTED)
 
             except KeyboardInterrupt:
-                print("\n⚠️  Interrupted. Type 'exit' to quit.")
+                print("\n⚠️  Interrupting current turn...")
+                await scheduler.abort_all_tasks(TurnAbortReason.INTERRUPTED)
             except Exception as e:
                 import traceback
                 print(f"❌ Error: {e}")
