@@ -73,6 +73,7 @@ class RegularTask(SessionTask):
             "delegation": "",
             "budget_exhausted": False,
             "latest_tool_results": [],
+            "guard_retries": 0,
         }
 
         last_message: Optional[str] = None

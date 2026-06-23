@@ -59,6 +59,10 @@ class FileTracker:
 
     # ── 文件跟踪 ──────────────────────────────────────────────
 
+    def get_modified_files(self) -> list[str]:
+        """返回被写入/patch 过的文件列表（删除不算 modified）"""
+        return [p for p, snap in self._files.items() if snap.modified_at is not None]
+
     def record_file_read(
         self,
         file_path: str,

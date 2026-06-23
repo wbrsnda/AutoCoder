@@ -4,6 +4,7 @@ import platform
 import ast
 import re
 from typing import Annotated, TypedDict, Optional
+from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -15,6 +16,9 @@ from autocoder.orchestrator.hook_engine import HookEngine, HookEvent
 from autocoder.skills.builtin import match_skill
 from autocoder.context.file_tracker import FileTracker
 from autocoder.models.turn import TurnContext, TurnStatus, TurnPhase
+
+# ★ 引入记忆引用解析与美化函数
+from autocoder.memory.citations import parse_memory_citation, strip_citations
 
 OS_NAME = platform.system()
 ROLE_ARCHITECT = "architect"
@@ -224,6 +228,9 @@ def _build_deterministic_report(delegation: str, latest_tool_results: list) -> s
             fp = tool_args.get("file_path", "unknown")
             files_modified.append(fp)
             body.append(f"### 删除结果\n- 已删除: {fp}\n- 工具返回: {content}")
+        # ★ 拓展：原生支持格式化 Memory 检索工具的结果
+        elif tool_name in ("memories_search", "memories_read", "memories_list", "add_ad_hoc_note"):
+            body.append(f"### 长期记忆库检索结果 ({tool_name})\n- 参数: {tool_args}\n- 内容:\n{content[:3000]}")
         else:
             body.append(f"### 工具结果\n- Tool: {tool_name}\n- Args: {tool_args}\n- Content:\n{content[:4000]}")
 
@@ -244,23 +251,35 @@ def build_graph(
     mcp_tools: list,
     hook_engine: HookEngine = None,
     rag_tool=None,
+    memory_store=None,             # ★ 新增：传入记忆存储对象
+    memory_tools: list = None,     # ★ 新增：传入记忆工具列表
     max_tool_calls_per_turn: int = 15,
     workspace_dir: str = ".",
     file_tracker: FileTracker = None,
 ):
+    # ★ 记忆上下文注入器初始化
+    from autocoder.memory.injector import MemoryInjector
+    from autocoder.memory.models import MemoriesConfig
+
+    memory_injector = (
+        MemoryInjector(memory_store, MemoriesConfig(), Path(workspace_dir))
+        if memory_store
+        else None
+    )
+    memory_tools = memory_tools or []
+
     if hook_engine is None:
         hook_engine = HookEngine()
 
-    # ★ 使用外部传入的 file_tracker，不再创建新的覆盖
     if file_tracker is None:
         file_tracker = FileTracker()
 
-    all_tools = mcp_tools + ([rag_tool] if rag_tool else [])
+    # ★ Coder 拥有 mcp + rag + memory_tools；Architect 依然保持纯文本规划能力
+    all_tools = mcp_tools + ([rag_tool] if rag_tool else []) + memory_tools
     architect_bound = architect_llm
     coder_bound = coder_llm.bind_tools(all_tools)
     tool_map = {t.name: t for t in all_tools}
 
-    # ★ TurnContext 在闭包中管理，不经过 LangGraph state
     turn_ctx = TurnContext(max_tool_calls=max_tool_calls_per_turn)
 
     # ── Architect 节点 ────────────────────────────────────────
@@ -281,7 +300,27 @@ def build_graph(
         if context_summary:
             project_ctx += "\n" + context_summary
 
+        # ★ 将长期记忆摘要注入到架构师上下文
+        if memory_injector:
+            mem_fragment = memory_injector.build_system_prompt_fragment()
+            if mem_fragment:
+                project_ctx += "\n" + mem_fragment
+
         sys_content = ARCHITECT_SYSTEM.replace("__PROJECT_CONTEXT__", project_ctx)
+
+        # ★ 告知架构师如何委托记忆查询
+        if memory_store:
+            sys_content += (
+                "\n\n[LONG-TERM MEMORY POLICY]\n"
+                "You have access to persistent long-term memory loaded in MEMORY_SUMMARY above.\n"
+                "- If MEMORY_SUMMARY contains the answer, answer directly.\n"
+                "- If you need more historical details/decisions: DELEGATE TO CODER: Use memories_search with queries=\"<keywords>\"\n"
+                "- To inspect a memory file: DELEGATE TO CODER: Use memories_read with path=\"<relative_path>\"\n"
+                "- To list memories: DELEGATE TO CODER: Use memories_list with path=\"\"\n"
+                "- Memory tools operate on .autocoder/memories, NOT workspace files. NEVER use mcp_search_files for memory.\n"
+                "- Only delegate add_ad_hoc_note if the user explicitly says 'remember this' or 'save to memory'."
+            )
+
         if skill:
             sys_content += "\n\n[SKILL ACTIVATED]:\n" + "\n".join(skill["steps"])
 
@@ -290,6 +329,13 @@ def build_graph(
 
         res = await architect_bound.ainvoke(msgs)
         content = (res.content or "").strip()
+
+        # ★ 追踪长期记忆引用
+        if memory_store and content:
+            citation = parse_memory_citation(content)
+            if citation and not citation.is_empty:
+                for mid in citation.rollout_ids:
+                    memory_store.touch(mid)
 
         if not content or content == "None":
             print("\n⚠️  [Guard] Architect empty. Injecting guidance...")
@@ -316,7 +362,6 @@ def build_graph(
 
         if "AWAITING USER INPUT" in content:
             turn_ctx.complete(content)
-            # ★ 修复：用 to_event() 而不是不存在的 to_summary()
             print(f"📊 {turn_ctx.to_event()}")
 
         return {
@@ -351,6 +396,15 @@ def build_graph(
             "Call exactly one tool if needed. Do not explain after deciding to call tools."
         )
 
+        # ★ 确保 Coder 在收到查询记忆的委托时准确调用对应工具
+        if memory_tools:
+            sys_content += (
+                "\n\n[MEMORY TOOLS]\n"
+                "If the task mentions memories_search, memories_read, memories_list, or add_ad_hoc_note:\n"
+                "You MUST call that exact tool. These operate on memory store (.autocoder/memories), NOT workspace files.\n"
+                "NEVER substitute mcp_search_files or mcp_read_file for a memory task."
+            )
+
         clean = [m for m in messages if not isinstance(m, SystemMessage)]
         msgs = [SystemMessage(content=sys_content)] + clean
 
@@ -381,11 +435,9 @@ def build_graph(
             tool_args = tool_call.get("args", {}) or {}
             call_id = tool_call["id"]
 
-            # ====================== 新增：参数自动补全 ======================
             if tool_name == "mcp_write_file":
                 if "file_path" not in tool_args:
                     content = tool_args.get("content", "")
-                    # 尝试从内容中猜测文件名
                     if "dynamic_programming" in content.lower() or "dp" in content.lower():
                         tool_args["file_path"] = "dynamic_programming_basics.py"
                     elif "fibonacci" in content.lower():
@@ -396,14 +448,11 @@ def build_graph(
                         tool_args["file_path"] = "new_script.py"
                     print(f"⚠️  [AutoFix] Architect 未提供 file_path，已自动补全为: {tool_args['file_path']}")
 
-            # ====================== 原有逻辑保持不变 ======================
-            # 去重检查
             if file_tracker.is_duplicate_call(tool_name, tool_args):
                 dup_msg = f"[Duplicate call skipped] {tool_name} was already called."
                 return (ToolMessage(content=dup_msg, tool_call_id=call_id),
                         {"tool_name": tool_name, "tool_args": tool_args, "content": dup_msg})
 
-            # 智能跳过已读文件
             if tool_name == "mcp_read_file":
                 fp = tool_args.get("file_path", "")
                 if file_tracker.is_file_read(fp):
@@ -412,7 +461,6 @@ def build_graph(
                     return (ToolMessage(content=skip_msg, tool_call_id=call_id),
                             {"tool_name": tool_name, "tool_args": tool_args, "content": skip_msg})
 
-            # Hook 检查
             hook_ctx = {"tool_name": tool_name, **tool_args}
             hook_result = hook_engine.evaluate(HookEvent.PRE_TOOL_USE, tool_name=tool_name, context=hook_ctx)
             if hook_result.should_block:
@@ -434,7 +482,6 @@ def build_graph(
             except Exception as e:
                 result_str = f"Error: {e}"
 
-            # 记录到 FileTracker
             file_tracker.record_tool_call(tool_name, tool_args, result_preview=result_str[:200],
                                         success=not result_str.startswith("Error:"))
 
@@ -490,7 +537,7 @@ def build_graph(
         context_summary = file_tracker.build_context_summary()
         if context_summary:
             report += "\n\n" + context_summary
-        print(f"\n📋 Coder Report:\n{report[:4000]}\n")
+        print(f"\n📋 Coder Report:\n{strip_citations(report)[:4000]}\n")
         return {"messages": [AIMessage(content=report)], "current_role": ROLE_CODER_REPORT}
 
     # ── 路由函数 ──────────────────────────────────────────────
