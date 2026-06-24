@@ -21,20 +21,18 @@ from langchain_core.tools import tool
 from autocoder.utils.config import Config
 from autocoder.agent.state_machine import build_graph
 from autocoder.rag.retriever import rag_search
-from autocoder.orchestrator.hook_engine import (
-    HookEngine, HookEvent, Rule, Condition, HookAction
-)
+from autocoder.orchestrator.hook_engine import HookEngine, HookEvent, Rule, Condition, HookAction
 from autocoder.context.file_tracker import FileTracker
 
-from autocoder.memory.models import MemoriesConfig
-from autocoder.memory.store import MemoryStore
-from autocoder.memory.extractor import StageOneExtractor
-from autocoder.memory.consolidator import PhaseTwoConsolidator
-from autocoder.memory.tools import create_memory_tools
-from autocoder.memory.rollout_recorder import RolloutRecorder
-from autocoder.memory.startup import MemoryStartupPipeline
+# ★ Memory imports
+from autocoder.memory import (
+    MemoryWorkspace, MemoryRecorder, MemoryConsolidator,
+    MemoryInjector, create_memory_tools,
+)
 
 file_tracker = FileTracker()
+
+CONSOLIDATE_EVERY_N_TURNS = 3  # 每 3 个 turn 整合一次
 
 
 async def create_mcp_tools(session):
@@ -56,10 +54,7 @@ async def create_mcp_tools(session):
     @tool
     async def mcp_search_files(regex: str, file_pattern: str = "*.*") -> str:
         """Search for a regex pattern in project files."""
-        res = await session.call_tool(
-            "search_files",
-            arguments={"regex": regex, "file_pattern": file_pattern}
-        )
+        res = await session.call_tool("search_files", arguments={"regex": regex, "file_pattern": file_pattern})
         return res.content[0].text
 
     @tool
@@ -71,23 +66,13 @@ async def create_mcp_tools(session):
     @tool
     async def mcp_write_file(file_path: str, content: str) -> str:
         """Write content to a file, creating parent directories if needed."""
-        res = await session.call_tool(
-            "write_file",
-            arguments={"file_path": file_path, "content": content}
-        )
+        res = await session.call_tool("write_file", arguments={"file_path": file_path, "content": content})
         return res.content[0].text
 
     @tool
     async def mcp_apply_patch(file_path: str, original: str, replacement: str) -> str:
         """Apply a targeted patch: replace exact text in a file."""
-        res = await session.call_tool(
-            "apply_patch",
-            arguments={
-                "file_path": file_path,
-                "original": original,
-                "replacement": replacement
-            }
-        )
+        res = await session.call_tool("apply_patch", arguments={"file_path": file_path, "original": original, "replacement": replacement})
         return res.content[0].text
 
     @tool
@@ -96,15 +81,7 @@ async def create_mcp_tools(session):
         res = await session.call_tool("delete_file", arguments={"file_path": file_path})
         return res.content[0].text
 
-    return [
-        mcp_list_dir,
-        mcp_read_file,
-        mcp_search_files,
-        mcp_execute_bash,
-        mcp_write_file,
-        mcp_apply_patch,
-        mcp_delete_file,
-    ]
+    return [mcp_list_dir, mcp_read_file, mcp_search_files, mcp_execute_bash, mcp_write_file, mcp_apply_patch, mcp_delete_file]
 
 
 async def read_input(prompt: str = "🧑 You: ") -> str | None:
@@ -117,7 +94,7 @@ async def read_input(prompt: str = "🧑 You: ") -> str | None:
 
 
 async def main():
-    print("🚀 AutoCoder v6 Starting (Codex-style automatic memory)...")
+    print("🚀 AutoCoder v6 Starting (Pure file-based memory)...")
     Config.apply_proxy()
 
     workspace = Config.WORKSPACE_DIR
@@ -165,43 +142,19 @@ async def main():
             temperature=0.0,
         )
 
-        # Codex-style memory config
-        memories_config = MemoriesConfig(
-            generate_memories=True,
-            use_memories=True,
-            enable_phase2=True,
-            use_vector_search=False,        # Windows + chroma 1.5.x 先禁掉
-            auto_startup_pipeline=True,
-            min_rollout_idle_hours=0,       # 方便你本地立即重启测试
-            max_rollouts_per_startup=8,
-            max_rollout_age_days=30,
-            max_unused_days=30,
-        )
-        memory_store = MemoryStore(workspace, memories_config)
-        memory_tools = create_memory_tools(memory_store, workspace)
+        # ★★★ Memory 初始化（纯文件，无 SQLite，无 ChromaDB）★★★
+        mem_workspace = MemoryWorkspace(workspace)
+        mem_workspace.ensure_initialized()
+        mem_recorder = MemoryRecorder(mem_workspace)
+        mem_consolidator = MemoryConsolidator(mem_workspace, architect_llm)
+        mem_injector = MemoryInjector(mem_workspace)
+        mem_tools = create_memory_tools(workspace)
 
-        stage1_extractor = StageOneExtractor(
-            llm=coder_llm,
-            config=memories_config,
-            store=memory_store,
-        )
-        phase2_consolidator = PhaseTwoConsolidator(
-            llm=architect_llm,
-            config=memories_config,
-            store=memory_store,
-        )
-
-        rollout_recorder = RolloutRecorder(workspace)
-        startup_pipeline = MemoryStartupPipeline(
-            workspace_dir=workspace,
-            config=memories_config,
-            store=memory_store,
-            extractor=stage1_extractor,
-            consolidator=phase2_consolidator,
-        )
-
-        # 启动时自动扫描和提取历史 rollout
-        await startup_pipeline.run_once(active_session_id=rollout_recorder.session_id)
+        summary_preview = mem_workspace.read_file("memory_summary.md").strip()
+        if summary_preview:
+            print(f"🧠 Memory: loaded summary ({len(summary_preview)} chars)")
+        else:
+            print("🧠 Memory: no prior summary (fresh start)")
 
         graph = build_graph(
             architect_llm=architect_llm,
@@ -209,29 +162,23 @@ async def main():
             mcp_tools=mcp_tools,
             hook_engine=hook_engine,
             rag_tool=rag_search,
-            memory_store=memory_store,
-            memory_tools=memory_tools,
+            memory_tools=mem_tools,          # ★
+            memory_injector=mem_injector,    # ★
             max_tool_calls_per_turn=15,
             workspace_dir=str(workspace),
             file_tracker=file_tracker,
         )
 
         from autocoder.tasks import (
-            TaskScheduler, SessionTaskContext, RegularTask,
-            EventBus, TurnAbortReason
+            TaskScheduler, SessionTaskContext, RegularTask, EventBus, TurnAbortReason
         )
         from autocoder.models.turn import TurnContext, TurnStatus
 
         lang_config = {"configurable": {"thread_id": "main_session"}}
         event_bus = EventBus()
-        session_ctx = SessionTaskContext(
-            graph=graph,
-            lang_config=lang_config,
-            event_bus=event_bus,
-        )
+        session_ctx = SessionTaskContext(graph=graph, lang_config=lang_config, event_bus=event_bus)
         scheduler = TaskScheduler(session_ctx)
 
-        print(f"🧠 Memory: {memory_store.get_memory_count()} memories loaded")
         print(f"✅ Ready. Workspace: {workspace}")
         print("💡 Enter your request. Ctrl+C to interrupt. 'exit' to quit.\n")
 
@@ -265,31 +212,31 @@ async def main():
                     try:
                         await scheduler._active.done.wait()
                     except KeyboardInterrupt:
-                        print("\n⚠️ Ctrl+C detected, interrupting...")
+                        print("\n⚠️ Ctrl+C interrupting...")
                         await scheduler.abort_all_tasks(TurnAbortReason.INTERRUPTED)
 
-                # 只记录 rollout；不在这里做长期记忆提取
+                # ★★★ Turn 结束 - 记录 + 周期性整合 ★★★
                 if ctx.status == TurnStatus.COMPLETED:
-                    new_tool_records = []
-                    for r in file_tracker._tool_history[before_tool_count:]:
-                        new_tool_records.append({
-                            "tool_name": r.tool_name,
-                            "result_preview": r.result_preview,
-                            "success": r.success,
-                            "timestamp": r.timestamp,
-                        })
-
-                    rollout_recorder.append_turn(
-                        turn_id=ctx.turn_id,
+                    new_tools = [
+                        {"tool_name": r.tool_name, "tool_args": {}, "success": r.success}
+                        for r in file_tracker._tool_history[before_tool_count:]
+                    ]
+                    mem_recorder.record_turn(
                         user_input=user_input,
-                        assistant_response=ctx.last_agent_message or "",
-                        tool_records=new_tool_records,
-                        cwd=str(workspace),
-                        file_stats=file_tracker.get_stats(),
+                        architect_response=ctx.last_agent_message or "",
+                        tool_calls=new_tools,
                     )
 
+                    # 每 N 个 turn 整合一次
+                    if mem_recorder.turn_count > 0 and mem_recorder.turn_count % CONSOLIDATE_EVERY_N_TURNS == 0:
+                        print(f"\n🧠 [Memory] Triggering consolidation (turn {mem_recorder.turn_count})...")
+                        try:
+                            await mem_consolidator.consolidate()
+                        except Exception as e:
+                            print(f"⚠️  [Memory] Consolidation error: {e}")
+
             except KeyboardInterrupt:
-                print("\n⚠️ Interrupting current turn...")
+                print("\n⚠️ Interrupting...")
                 await scheduler.abort_all_tasks(TurnAbortReason.INTERRUPTED)
             except Exception as e:
                 import traceback

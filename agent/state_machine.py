@@ -17,9 +17,6 @@ from autocoder.skills.builtin import match_skill
 from autocoder.context.file_tracker import FileTracker
 from autocoder.models.turn import TurnContext, TurnStatus, TurnPhase
 
-# ★ 引入记忆引用解析与美化函数
-from autocoder.memory.citations import parse_memory_citation, strip_citations
-
 OS_NAME = platform.system()
 ROLE_ARCHITECT = "architect"
 ROLE_CODER = "coder"
@@ -45,14 +42,12 @@ def _strip_line_numbers(text: str) -> str:
 
 def _summarize_list_dir(content: str) -> str:
     lines = [line.strip() for line in content.splitlines() if line.strip()]
-    files = []
-    dirs = []
+    files, dirs = [], []
     for line in lines:
         if line.startswith("[FILE] "):
             files.append(line.replace("[FILE] ", "", 1))
         elif line.startswith("[DIR] "):
             dirs.append(line.replace("[DIR] ", "", 1))
-
     parts = ["### 目录内容"]
     if dirs:
         parts.append(f"- 目录: {', '.join(dirs)}")
@@ -66,20 +61,16 @@ def _summarize_list_dir(content: str) -> str:
 def _collect_code_patterns(source: str) -> dict:
     lines = source.splitlines()
     patterns = {
-        "数据加载": ["Dataset", "DataLoader", "read_csv", "torch.load", "np.load", "__getitem__", "__len__"],
-        "模型定义": ["nn.Module", "TransformerEncoder", "Linear(", "LayerNorm", "Softplus", "ReLU"],
-        "训练循环": ["model.train()", "optimizer.zero_grad()", "loss.backward()", "optimizer.step()", "for epoch"],
-        "验证评估": ["model.eval()", "torch.no_grad()", "evaluate", "mae", "obo", "valid", "test"],
-        "保存模型": ["torch.save", "state_dict", "checkpoint", "os.replace"],
-        "参数解析": ["argparse", "ArgumentParser", "add_argument"],
+        "数据加载": ["Dataset", "DataLoader", "read_csv", "torch.load", "np.load"],
+        "模型定义": ["nn.Module", "TransformerEncoder", "Linear(", "LayerNorm"],
+        "训练循环": ["model.train()", "optimizer.zero_grad()", "loss.backward()"],
+        "验证评估": ["model.eval()", "torch.no_grad()", "evaluate"],
+        "保存模型": ["torch.save", "state_dict", "checkpoint"],
+        "参数解析": ["argparse", "ArgumentParser"],
     }
     hits = {}
     for group, keys in patterns.items():
-        group_hits = []
-        for idx, line in enumerate(lines, 1):
-            stripped = line.strip()
-            if any(k in stripped for k in keys):
-                group_hits.append(f"L{idx}: {stripped}")
+        group_hits = [f"L{i}: {l.strip()}" for i, l in enumerate(lines, 1) if any(k in l.strip() for k in keys)]
         if group_hits:
             hits[group] = group_hits
     return hits
@@ -90,48 +81,23 @@ def _summarize_python_file(file_path: str, content: str) -> str:
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
-        return (
-            f"### 文件分析: {file_path}\n"
-            f"- 无法解析 AST: {e}\n"
-            f"- 这通常表示读取内容不完整或源码本身存在语法问题。"
-        )
+        return f"### 文件分析: {file_path}\n- 无法解析 AST: {e}"
 
     module_doc = ast.get_docstring(tree)
-    imports = []
-    classes = []
-    functions = []
-    has_main = False
+    imports, classes, functions = [], [], []
 
     for node in tree.body:
         if isinstance(node, ast.Import):
-            names = [a.name for a in node.names]
-            imports.append(f"L{node.lineno}: import {', '.join(names)}")
+            imports.append(f"L{node.lineno}: import {', '.join(a.name for a in node.names)}")
         elif isinstance(node, ast.ImportFrom):
-            mod = node.module or ""
-            names = [a.name for a in node.names]
-            imports.append(f"L{node.lineno}: from {mod} import {', '.join(names)}")
+            imports.append(f"L{node.lineno}: from {node.module or ''} import {', '.join(a.name for a in node.names)}")
         elif isinstance(node, ast.ClassDef):
-            methods = []
-            for sub in node.body:
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    methods.append(sub.name)
+            methods = [s.name for s in node.body if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))]
             classes.append((node.name, node.lineno, methods))
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            args = [a.arg for a in node.args.args]
-            functions.append((node.name, node.lineno, args))
+            functions.append((node.name, node.lineno, [a.arg for a in node.args.args]))
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.If):
-            test = node.test
-            if (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
-                    and test.left.id == "__name__"):
-                for comp in test.comparators:
-                    if isinstance(comp, ast.Constant) and comp.value == "__main__":
-                        has_main = True
-
-    patterns = _collect_code_patterns(source)
     parts = [f"### 文件分析: {file_path}"]
-
     if module_doc:
         parts.append(f"- 模块说明: {module_doc.strip().splitlines()[0]}")
     if imports:
@@ -140,36 +106,12 @@ def _summarize_python_file(file_path: str, content: str) -> str:
             parts.append(f"  - {item}")
     if classes:
         parts.append("- 类结构:")
-        for name, lineno, methods in classes:
-            method_text = ", ".join(methods[:15]) if methods else "无明显方法"
-            parts.append(f"  - L{lineno}: class `{name}` -> 方法: {method_text}")
+        for name, ln, methods in classes:
+            parts.append(f"  - L{ln}: class `{name}` -> 方法: {', '.join(methods[:10]) if methods else '无'}")
     if functions:
         parts.append("- 顶层函数:")
-        for name, lineno, args in functions[:20]:
-            parts.append(f"  - L{lineno}: `{name}({', '.join(args)})`")
-    if patterns:
-        parts.append("- 代码模式证据:")
-        for group, hits in patterns.items():
-            parts.append(f"  - {group}:")
-            for h in hits[:6]:
-                parts.append(f"    - {h}")
-
-    judgement = []
-    function_names = {name for name, _, _ in functions}
-    class_names = {name for name, _, _ in classes}
-    if "train" in function_names:
-        judgement.append("该文件包含 `train()` 入口，属于训练主流程或训练入口文件。")
-    if "StrongDensityTransformer" in class_names:
-        judgement.append("文件中定义了 `StrongDensityTransformer` 模型，是核心模型结构。")
-    if has_main:
-        judgement.append("文件包含 `if __name__ == '__main__'`，可直接作为脚本运行。")
-    if "保存模型" in patterns:
-        judgement.append("文件中包含 checkpoint 保存逻辑。")
-    if judgement:
-        parts.append("- 综合判断:")
-        for j in judgement:
-            parts.append(f"  - {j}")
-
+        for name, ln, args in functions[:20]:
+            parts.append(f"  - L{ln}: `{name}({', '.join(args)})`")
     return "\n".join(parts)
 
 
@@ -177,30 +119,15 @@ def _summarize_text_file(file_path: str, content: str) -> str:
     source = _strip_line_numbers(content)
     lines = [line for line in source.splitlines() if line.strip()]
     preview = "\n".join(lines[:20])
-    return (
-        f"### 文件分析: {file_path}\n"
-        f"- 这是一个文本文件。\n"
-        f"- 前 20 行预览:\n{preview}"
-    )
+    return f"### 文件分析: {file_path}\n- 这是一个文本文件。\n- 前 20 行预览:\n{preview}"
 
 
 def _build_deterministic_report(delegation: str, latest_tool_results: list) -> str:
     if not latest_tool_results:
-        return (
-            "REPORT TO ARCHITECT:\n"
-            f"- **Task**: {delegation}\n"
-            "- **Status**: Failed\n"
-            "- **Issues Found**: No tool results were captured for this task."
-        )
-    parts = [
-        "REPORT TO ARCHITECT:",
-        f"- **Task**: {delegation}",
-        "- **Status**: Complete",
-    ]
-    files_read = []
-    files_modified = []
-    issues = []
-    body = []
+        return f"REPORT TO ARCHITECT:\n- **Task**: {delegation}\n- **Status**: Failed\n- **Issues Found**: No tool results."
+
+    parts = ["REPORT TO ARCHITECT:", f"- **Task**: {delegation}", "- **Status**: Complete"]
+    files_read, files_modified, issues, body = [], [], [], []
 
     for item in latest_tool_results:
         tool_name = item.get("tool_name", "unknown")
@@ -210,27 +137,15 @@ def _build_deterministic_report(delegation: str, latest_tool_results: list) -> s
         if tool_name == "mcp_list_dir":
             body.append(_summarize_list_dir(content))
         elif tool_name == "mcp_read_file":
-            file_path = tool_args.get("file_path", "unknown")
-            files_read.append(file_path)
-            if file_path.endswith(".py"):
-                body.append(_summarize_python_file(file_path, content))
-            else:
-                body.append(_summarize_text_file(file_path, content))
+            fp = tool_args.get("file_path", "unknown")
+            files_read.append(fp)
+            body.append(_summarize_python_file(fp, content) if fp.endswith(".py") else _summarize_text_file(fp, content))
         elif tool_name == "mcp_write_file":
             fp = tool_args.get("file_path", "unknown")
             files_modified.append(fp)
             body.append(f"### 写文件结果\n- 已写入: {fp}\n- 工具返回: {content}")
-        elif tool_name == "mcp_apply_patch":
-            fp = tool_args.get("file_path", "unknown")
-            files_modified.append(fp)
-            body.append(f"### Patch 结果\n- 已修改: {fp}\n- 工具返回: {content}")
-        elif tool_name == "mcp_delete_file":
-            fp = tool_args.get("file_path", "unknown")
-            files_modified.append(fp)
-            body.append(f"### 删除结果\n- 已删除: {fp}\n- 工具返回: {content}")
-        # ★ 拓展：原生支持格式化 Memory 检索工具的结果
         elif tool_name in ("memories_search", "memories_read", "memories_list", "add_ad_hoc_note"):
-            body.append(f"### 长期记忆库检索结果 ({tool_name})\n- 参数: {tool_args}\n- 内容:\n{content[:3000]}")
+            body.append(f"### Memory 结果\n- Tool: {tool_name}\n- Args: {tool_args}\n- Output:\n{content[:3000]}")
         else:
             body.append(f"### 工具结果\n- Tool: {tool_name}\n- Args: {tool_args}\n- Content:\n{content[:4000]}")
 
@@ -251,30 +166,20 @@ def build_graph(
     mcp_tools: list,
     hook_engine: HookEngine = None,
     rag_tool=None,
-    memory_store=None,             # ★ 新增：传入记忆存储对象
-    memory_tools: list = None,     # ★ 新增：传入记忆工具列表
+    memory_tools: list = None,           # ★ 新增
+    memory_injector=None,                 # ★ 新增
     max_tool_calls_per_turn: int = 15,
     workspace_dir: str = ".",
     file_tracker: FileTracker = None,
 ):
-    # ★ 记忆上下文注入器初始化
-    from autocoder.memory.injector import MemoryInjector
-    from autocoder.memory.models import MemoriesConfig
-
-    memory_injector = (
-        MemoryInjector(memory_store, MemoriesConfig(), Path(workspace_dir))
-        if memory_store
-        else None
-    )
-    memory_tools = memory_tools or []
-
     if hook_engine is None:
         hook_engine = HookEngine()
-
     if file_tracker is None:
         file_tracker = FileTracker()
+    if memory_tools is None:
+        memory_tools = []
 
-    # ★ Coder 拥有 mcp + rag + memory_tools；Architect 依然保持纯文本规划能力
+    # ★ Coder 拿到所有工具（mcp + rag + memory）
     all_tools = mcp_tools + ([rag_tool] if rag_tool else []) + memory_tools
     architect_bound = architect_llm
     coder_bound = coder_llm.bind_tools(all_tools)
@@ -282,7 +187,6 @@ def build_graph(
 
     turn_ctx = TurnContext(max_tool_calls=max_tool_calls_per_turn)
 
-    # ── Architect 节点 ────────────────────────────────────────
     async def architect_node(state: AgentState) -> dict:
         messages = await compress_history(state["messages"], architect_llm)
         nonlocal turn_ctx
@@ -300,27 +204,13 @@ def build_graph(
         if context_summary:
             project_ctx += "\n" + context_summary
 
-        # ★ 将长期记忆摘要注入到架构师上下文
+        # ★ 注入 memory_summary
         if memory_injector:
-            mem_fragment = memory_injector.build_system_prompt_fragment()
-            if mem_fragment:
-                project_ctx += "\n" + mem_fragment
+            mem_frag = memory_injector.build_system_prompt_fragment()
+            if mem_frag:
+                project_ctx += mem_frag
 
         sys_content = ARCHITECT_SYSTEM.replace("__PROJECT_CONTEXT__", project_ctx)
-
-        # ★ 告知架构师如何委托记忆查询
-        if memory_store:
-            sys_content += (
-                "\n\n[LONG-TERM MEMORY POLICY]\n"
-                "You have access to persistent long-term memory loaded in MEMORY_SUMMARY above.\n"
-                "- If MEMORY_SUMMARY contains the answer, answer directly.\n"
-                "- If you need more historical details/decisions: DELEGATE TO CODER: Use memories_search with queries=\"<keywords>\"\n"
-                "- To inspect a memory file: DELEGATE TO CODER: Use memories_read with path=\"<relative_path>\"\n"
-                "- To list memories: DELEGATE TO CODER: Use memories_list with path=\"\"\n"
-                "- Memory tools operate on .autocoder/memories, NOT workspace files. NEVER use mcp_search_files for memory.\n"
-                "- Only delegate add_ad_hoc_note if the user explicitly says 'remember this' or 'save to memory'."
-            )
-
         if skill:
             sys_content += "\n\n[SKILL ACTIVATED]:\n" + "\n".join(skill["steps"])
 
@@ -329,13 +219,6 @@ def build_graph(
 
         res = await architect_bound.ainvoke(msgs)
         content = (res.content or "").strip()
-
-        # ★ 追踪长期记忆引用
-        if memory_store and content:
-            citation = parse_memory_citation(content)
-            if citation and not citation.is_empty:
-                for mid in citation.rollout_ids:
-                    memory_store.touch(mid)
 
         if not content or content == "None":
             print("\n⚠️  [Guard] Architect empty. Injecting guidance...")
@@ -373,7 +256,6 @@ def build_graph(
             "latest_tool_results": [],
         }
 
-    # ── Coder 节点 ────────────────────────────────────────────
     async def coder_node(state: AgentState) -> dict:
         messages = await compress_history(state["messages"], architect_llm)
         delegation = state.get("delegation", "")
@@ -390,20 +272,10 @@ def build_graph(
 
         sys_content += (
             "\n\n[PHASE]: TOOL EXECUTION PHASE.\n"
-            "Your job in this phase is ONLY to call the required tool(s).\n"
-            "If a file is listed in [CONTEXT TRACKER] as already read and NOT modified, "
-            "DO NOT read it again.\n"
-            "Call exactly one tool if needed. Do not explain after deciding to call tools."
+            "Your job is to call the required tool(s). Match the tool name in the task.\n"
+            "If task says memories_search, call memories_search (NOT mcp_search_files).\n"
+            "Call exactly one tool. Do not explain after deciding."
         )
-
-        # ★ 确保 Coder 在收到查询记忆的委托时准确调用对应工具
-        if memory_tools:
-            sys_content += (
-                "\n\n[MEMORY TOOLS]\n"
-                "If the task mentions memories_search, memories_read, memories_list, or add_ad_hoc_note:\n"
-                "You MUST call that exact tool. These operate on memory store (.autocoder/memories), NOT workspace files.\n"
-                "NEVER substitute mcp_search_files or mcp_read_file for a memory task."
-            )
 
         clean = [m for m in messages if not isinstance(m, SystemMessage)]
         msgs = [SystemMessage(content=sys_content)] + clean
@@ -419,12 +291,8 @@ def build_graph(
         if res.tool_calls:
             print(f"🛠️  Tools: {[tc['name'] for tc in res.tool_calls]}")
 
-        return {
-            "messages": [res],
-            "current_role": ROLE_CODER,
-        }
+        return {"messages": [res], "current_role": ROLE_CODER}
 
-    # ── hooked_tools_node ─────────────────────────────────────
     async def hooked_tools_node(state: AgentState) -> dict:
         last_msg = state["messages"][-1]
         if not getattr(last_msg, "tool_calls", None):
@@ -435,70 +303,59 @@ def build_graph(
             tool_args = tool_call.get("args", {}) or {}
             call_id = tool_call["id"]
 
-            if tool_name == "mcp_write_file":
-                if "file_path" not in tool_args:
-                    content = tool_args.get("content", "")
-                    if "dynamic_programming" in content.lower() or "dp" in content.lower():
-                        tool_args["file_path"] = "dynamic_programming_basics.py"
-                    elif "fibonacci" in content.lower():
-                        tool_args["file_path"] = "fibonacci_dp.py"
-                    elif "knapsack" in content.lower():
-                        tool_args["file_path"] = "knapsack_dp.py"
-                    else:
-                        tool_args["file_path"] = "new_script.py"
-                    print(f"⚠️  [AutoFix] Architect 未提供 file_path，已自动补全为: {tool_args['file_path']}")
+            if tool_name == "mcp_write_file" and "file_path" not in tool_args:
+                tool_args["file_path"] = "new_script.py"
+                print(f"⚠️  [AutoFix] file_path auto-filled")
 
-            if file_tracker.is_duplicate_call(tool_name, tool_args):
-                dup_msg = f"[Duplicate call skipped] {tool_name} was already called."
-                return (ToolMessage(content=dup_msg, tool_call_id=call_id),
-                        {"tool_name": tool_name, "tool_args": tool_args, "content": dup_msg})
+            # 仅对 mcp_ 工具做去重和已读检查
+            if tool_name.startswith("mcp_") and file_tracker.is_duplicate_call(tool_name, tool_args):
+                msg = f"[Duplicate call skipped] {tool_name}"
+                return (ToolMessage(content=msg, tool_call_id=call_id),
+                        {"tool_name": tool_name, "tool_args": tool_args, "content": msg})
 
             if tool_name == "mcp_read_file":
                 fp = tool_args.get("file_path", "")
-                if file_tracker.is_file_read(fp):
+                snap = file_tracker._files.get(fp)
+                if snap and not snap.is_stale:
                     summary = file_tracker.get_file_summary(fp)
-                    skip_msg = f"[Already read] {fp}. Summary: {summary}."
-                    return (ToolMessage(content=skip_msg, tool_call_id=call_id),
-                            {"tool_name": tool_name, "tool_args": tool_args, "content": skip_msg})
+                    msg = f"[Already read] {fp}. Summary: {summary}."
+                    return (ToolMessage(content=msg, tool_call_id=call_id),
+                            {"tool_name": tool_name, "tool_args": tool_args, "content": msg})
 
             hook_ctx = {"tool_name": tool_name, **tool_args}
             hook_result = hook_engine.evaluate(HookEvent.PRE_TOOL_USE, tool_name=tool_name, context=hook_ctx)
             if hook_result.should_block:
-                blocked_msg = f"Blocked: {hook_result.block_reason}"
-                return (ToolMessage(content=blocked_msg, tool_call_id=call_id),
-                        {"tool_name": tool_name, "tool_args": tool_args, "content": blocked_msg})
+                msg = f"Blocked: {hook_result.block_reason}"
+                return (ToolMessage(content=msg, tool_call_id=call_id),
+                        {"tool_name": tool_name, "tool_args": tool_args, "content": msg})
 
             if tool_name not in tool_map:
-                not_found = f"Tool not found: {tool_name}"
-                return (ToolMessage(content=not_found, tool_call_id=call_id),
-                        {"tool_name": tool_name, "tool_args": tool_args, "content": not_found})
+                msg = f"Tool not found: {tool_name}"
+                return (ToolMessage(content=msg, tool_call_id=call_id),
+                        {"tool_name": tool_name, "tool_args": tool_args, "content": msg})
 
             try:
                 tool_obj = tool_map[tool_name]
-                result = (await tool_obj.ainvoke(tool_args)
-                        if hasattr(tool_obj, "ainvoke")
-                        else tool_obj.invoke(tool_args))
+                result = await tool_obj.ainvoke(tool_args) if hasattr(tool_obj, "ainvoke") else tool_obj.invoke(tool_args)
                 result_str = str(result)
             except Exception as e:
                 result_str = f"Error: {e}"
 
-            file_tracker.record_tool_call(tool_name, tool_args, result_preview=result_str[:200],
-                                        success=not result_str.startswith("Error:"))
-
-            if tool_name == "mcp_read_file" and not result_str.startswith("Error:"):
-                fp = tool_args.get("file_path", "unknown")
-                summary = _summarize_python_file(fp, result_str) if fp.endswith(".py") else f"{result_str.count(chr(10))+1} lines"
-                file_tracker.record_file_read(fp, result_str, summary[:500])
-            elif tool_name == "mcp_list_dir" and not result_str.startswith("Error:"):
-                file_tracker.record_dir_listing(tool_args.get("directory", "."), result_str)
-            elif tool_name in ("mcp_write_file", "mcp_apply_patch"):
-                fp = tool_args.get("file_path", "")
-                if fp:
-                    file_tracker.record_file_modified(fp)
-            elif tool_name == "mcp_delete_file":
-                fp = tool_args.get("file_path", "")
-                if fp:
-                    file_tracker.record_file_deleted(fp)
+            if tool_name.startswith("mcp_"):
+                file_tracker.record_tool_call(tool_name, tool_args, result_preview=result_str[:200],
+                                              success=not result_str.startswith("Error:"))
+                if tool_name == "mcp_read_file" and not result_str.startswith("Error:"):
+                    fp = tool_args.get("file_path", "unknown")
+                    summary = _summarize_python_file(fp, result_str) if fp.endswith(".py") else f"{len(result_str.splitlines())} lines"
+                    file_tracker.record_file_read(fp, result_str, summary[:500])
+                elif tool_name == "mcp_list_dir" and not result_str.startswith("Error:"):
+                    file_tracker.record_dir_listing(tool_args.get("directory", "."), result_str)
+                elif tool_name in ("mcp_write_file", "mcp_apply_patch"):
+                    fp = tool_args.get("file_path", "")
+                    if fp: file_tracker.record_file_modified(fp)
+                elif tool_name == "mcp_delete_file":
+                    fp = tool_args.get("file_path", "")
+                    if fp: file_tracker.record_file_deleted(fp)
 
             hook_engine.evaluate(HookEvent.POST_TOOL_USE, tool_name=tool_name, context={**hook_ctx, "result": result_str[:300]})
 
@@ -510,26 +367,19 @@ def build_graph(
         print(f"📊 [Context] files_read={stats['files_read']}, stale={stats['files_stale']}, tool_calls={stats['tool_calls_total']}")
         return {"messages": [x[0] for x in results], "latest_tool_results": [x[1] for x in results]}
 
-    # ── Budget 节点 ───────────────────────────────────────────
     async def budget_node(state: AgentState) -> dict:
         nonlocal turn_ctx
         exhausted = turn_ctx.increment_tool_call()
         count = turn_ctx.tool_calls
-
         if exhausted:
             steering = HumanMessage(
                 content="[System]: Budget exhausted. Output REPORT TO ARCHITECT.",
                 name="SystemRuntime",
             )
             print(f"⚠️  [Budget] Exhausted at {count}/{turn_ctx.max_tool_calls}")
-            return {
-                "messages": [steering],
-                "tool_call_count": count,
-                "budget_exhausted": True,
-            }
+            return {"messages": [steering], "tool_call_count": count, "budget_exhausted": True}
         return {"tool_call_count": count}
 
-    # ── Coder Report 节点 ─────────────────────────────────────
     async def coder_report_node(state: AgentState) -> dict:
         delegation = state.get("delegation", "")
         latest_tool_results = state.get("latest_tool_results", [])
@@ -537,13 +387,11 @@ def build_graph(
         context_summary = file_tracker.build_context_summary()
         if context_summary:
             report += "\n\n" + context_summary
-        print(f"\n📋 Coder Report:\n{strip_citations(report)[:4000]}\n")
+        print(f"\n📋 Coder Report:\n{report[:4000]}\n")
         return {"messages": [AIMessage(content=report)], "current_role": ROLE_CODER_REPORT}
 
-    # ── 路由函数 ──────────────────────────────────────────────
-    def route_after_architect(state: AgentState):
+    def route_after_architect(state):
         last_msg = state["messages"][-1]
-        content = getattr(last_msg, "content", "") or ""
         delegation = state.get("delegation", "").strip()
         if getattr(last_msg, "name", "") == "SystemRuntime":
             return "architect"
@@ -551,7 +399,7 @@ def build_graph(
             return "coder"
         return END
 
-    def route_after_coder(state: AgentState):
+    def route_after_coder(state):
         last_msg = state["messages"][-1]
         content = getattr(last_msg, "content", "") or ""
         if getattr(last_msg, "tool_calls", None):
@@ -562,16 +410,15 @@ def build_graph(
             return "architect"
         return END
 
-    def route_after_budget(state: AgentState):
+    def route_after_budget(state):
         return "coder_report"
 
-    def route_after_coder_report(state: AgentState):
+    def route_after_coder_report(state):
         last_msg = state["messages"][-1]
         if getattr(last_msg, "name", "") == "SystemRuntime":
             return "coder_report"
         return "architect"
 
-    # ── 构建图 ────────────────────────────────────────────────
     builder = StateGraph(AgentState)
     builder.add_node("architect", architect_node)
     builder.add_node("coder", coder_node)
