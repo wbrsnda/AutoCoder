@@ -1,9 +1,43 @@
+"""
+Citation 解析（自包含，不依赖已删除的 models.py）。
+"""
 from __future__ import annotations
 
 import re
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, List
 
-from autocoder.memory.models import MemoryCitation, MemoryCitationEntry
+
+@dataclass
+class MemoryCitationEntry:
+    path: str
+    line_start: int
+    line_end: int
+    note: str
+
+    @classmethod
+    def parse(cls, line: str) -> Optional["MemoryCitationEntry"]:
+        line = line.strip()
+        if not line or "|note=[" not in line:
+            return None
+        try:
+            location, note_part = line.rsplit("|note=[", 1)
+            note = note_part.rstrip("]").strip()
+            path, line_range = location.rsplit(":", 1)
+            start, end = line_range.split("-")
+            return cls(path=path.strip(), line_start=int(start), line_end=int(end), note=note)
+        except Exception:
+            return None
+
+
+@dataclass
+class MemoryCitation:
+    entries: List[MemoryCitationEntry] = field(default_factory=list)
+    rollout_ids: List[str] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.entries and not self.rollout_ids
 
 
 def extract_block(text: str, open_tag: str, close_tag: str) -> Optional[str]:
@@ -20,25 +54,22 @@ def extract_block(text: str, open_tag: str, close_tag: str) -> Optional[str]:
 def parse_memory_citation(text: str) -> Optional[MemoryCitation]:
     entries = []
     rollout_ids = []
-    seen_ids = set()
+    seen = set()
 
-    entries_block = extract_block(text, "<citation_entries>", "</citation_entries>")
-    if entries_block:
-        for line in entries_block.splitlines():
-            entry = MemoryCitationEntry.parse(line)
-            if entry:
-                entries.append(entry)
+    block = extract_block(text, "<citation_entries>", "</citation_entries>")
+    if block:
+        for line in block.splitlines():
+            e = MemoryCitationEntry.parse(line)
+            if e:
+                entries.append(e)
 
-    for open_tag, close_tag in [
-        ("<rollout_ids>", "</rollout_ids>"),
-        ("<thread_ids>", "</thread_ids>"),
-    ]:
-        ids_block = extract_block(text, open_tag, close_tag)
-        if ids_block:
-            for line in ids_block.splitlines():
+    for o, c in [("<rollout_ids>", "</rollout_ids>"), ("<thread_ids>", "</thread_ids>")]:
+        b = extract_block(text, o, c)
+        if b:
+            for line in b.splitlines():
                 line = line.strip()
-                if line and line not in seen_ids:
-                    seen_ids.add(line)
+                if line and line not in seen:
+                    seen.add(line)
                     rollout_ids.append(line)
 
     if not entries and not rollout_ids:
