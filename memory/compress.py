@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 from langchain_core.messages import SystemMessage, ToolMessage
+from autocoder.utils.config import Config
 
 TOOL_MSG_MAX_CHARS = 600
 SUMMARY_PREFIX = "[Session Summary]"
@@ -22,8 +21,14 @@ def truncate_tool_message(msg: ToolMessage) -> ToolMessage:
     )
 
 
-async def compress_history(messages: list, llm, threshold: int = 28, keep_recent: int = 12) -> list:
-    if len(messages) <= threshold:
+async def compress_history(messages: list, llm, threshold: int = 24, keep_recent: int = 10) -> list:
+    total_chars = sum(len(str(getattr(m, "content", "")) or "") for m in messages)
+    
+    # ★ 双重触发门槛：条数超过 threshold OR 字符总量超过 COMPRESS_MAX_CHARS
+    need_compress = (len(messages) > threshold) or (total_chars > Config.COMPRESS_MAX_CHARS)
+    print(f"🔎 [CompressCheck] msgs={len(messages)}/{threshold} chars={total_chars}/{Config.COMPRESS_MAX_CHARS} trigger={need_compress}")
+
+    if not need_compress:
         return messages
 
     sys_msgs = [m for m in messages if isinstance(m, SystemMessage) and not is_summary_message(m)]
@@ -65,4 +70,7 @@ async def compress_history(messages: list, llm, threshold: int = 28, keep_recent
         print(f"⚠️ [Memory] Compression failed: {e}")
         compressed = SystemMessage(content=f"{SUMMARY_PREFIX}\n[Previous {len(old_msgs)} messages summarized after failure]")
 
-    return sys_msgs + [compressed] + recent_msgs
+    result_msgs = sys_msgs + [compressed] + recent_msgs
+    after_chars = sum(len(str(getattr(m, "content", "")) or "") for m in result_msgs)
+    print(f"✅ [Memory] Compressed from {len(messages)} msgs ({total_chars} chars) to {len(result_msgs)} msgs ({after_chars} chars)")
+    return result_msgs

@@ -16,6 +16,7 @@ from autocoder.orchestrator.hook_engine import HookEngine, HookEvent
 from autocoder.skills.builtin import match_skill
 from autocoder.context.file_tracker import FileTracker
 from autocoder.models.turn import TurnContext, TurnStatus, TurnPhase
+from autocoder.utils.config import Config
 
 OS_NAME = platform.system()
 ROLE_ARCHITECT = "architect"
@@ -23,6 +24,7 @@ ROLE_CODER = "coder"
 ROLE_CODER_REPORT = "coder_report"
 
 
+# ★ 严格保留 operator.add，确保 Checkpoint 记忆跨会话正常累积，不失忆！
 class AgentState(TypedDict):
     messages: Annotated[list, operator.add]
     tool_call_count: int
@@ -30,6 +32,7 @@ class AgentState(TypedDict):
     delegation: str
     budget_exhausted: bool
     latest_tool_results: list
+    guard_retries: int
 
 
 def _strip_line_numbers(text: str) -> str:
@@ -166,8 +169,8 @@ def build_graph(
     mcp_tools: list,
     hook_engine: HookEngine = None,
     rag_tool=None,
-    memory_tools: list = None,           # ★ 新增
-    memory_injector=None,                 # ★ 新增
+    memory_tools: list = None,
+    memory_injector=None,
     max_tool_calls_per_turn: int = 15,
     workspace_dir: str = ".",
     file_tracker: FileTracker = None,
@@ -179,7 +182,6 @@ def build_graph(
     if memory_tools is None:
         memory_tools = []
 
-    # ★ Coder 拿到所有工具（mcp + rag + memory）
     all_tools = mcp_tools + ([rag_tool] if rag_tool else []) + memory_tools
     architect_bound = architect_llm
     coder_bound = coder_llm.bind_tools(all_tools)
@@ -188,7 +190,12 @@ def build_graph(
     turn_ctx = TurnContext(max_tool_calls=max_tool_calls_per_turn)
 
     async def architect_node(state: AgentState) -> dict:
-        messages = await compress_history(state["messages"], architect_llm)
+        raw_msgs = state["messages"]
+        print(f"🔎 [ArchIN] checkpoint_msgs={len(raw_msgs)}")
+
+        # 实时压缩提示词副本，防止喂给模型的 Prompt 超过 8192
+        messages = await compress_history(raw_msgs, architect_llm)
+        
         nonlocal turn_ctx
         turn_ctx.phase = TurnPhase.ARCHITECTURE
 
@@ -204,7 +211,6 @@ def build_graph(
         if context_summary:
             project_ctx += "\n" + context_summary
 
-        # ★ 注入 memory_summary
         if memory_injector:
             mem_frag = memory_injector.build_system_prompt_fragment()
             if mem_frag:
@@ -220,7 +226,22 @@ def build_graph(
         res = await architect_bound.ainvoke(msgs)
         content = (res.content or "").strip()
 
+        # ── Guard 限流保护，杜绝死循环 ──
+        guard_retries = state.get("guard_retries", 0)
         if not content or content == "None":
+            if guard_retries >= Config.MAX_GUARD_RETRIES:
+                print(f"❌ [Guard] Max retries ({Config.MAX_GUARD_RETRIES}) reached. Output fallback.")
+                fail_msg = AIMessage(content="模型生成回复中断。请您继续输入或指示下一步。")
+                return {
+                    "messages": [fail_msg],
+                    "current_role": ROLE_ARCHITECT,
+                    "delegation": "",
+                    "tool_call_count": 0,
+                    "budget_exhausted": False,
+                    "latest_tool_results": [],
+                    "guard_retries": 0,
+                }
+
             print("\n⚠️  [Guard] Architect empty. Injecting guidance...")
             guidance = HumanMessage(
                 content="[System]: You must either delegate to coder or answer the user and end with AWAITING USER INPUT.",
@@ -233,6 +254,7 @@ def build_graph(
                 "tool_call_count": 0,
                 "budget_exhausted": False,
                 "latest_tool_results": [],
+                "guard_retries": guard_retries + 1,
             }
 
         print(f"\n🏛️  Architect:\n{content}\n")
@@ -254,6 +276,7 @@ def build_graph(
             "tool_call_count": 0,
             "budget_exhausted": False,
             "latest_tool_results": [],
+            "guard_retries": 0,
         }
 
     async def coder_node(state: AgentState) -> dict:
@@ -307,7 +330,6 @@ def build_graph(
                 tool_args["file_path"] = "new_script.py"
                 print(f"⚠️  [AutoFix] file_path auto-filled")
 
-            # 仅对 mcp_ 工具做去重和已读检查
             if tool_name.startswith("mcp_") and file_tracker.is_duplicate_call(tool_name, tool_args):
                 msg = f"[Duplicate call skipped] {tool_name}"
                 return (ToolMessage(content=msg, tool_call_id=call_id),
