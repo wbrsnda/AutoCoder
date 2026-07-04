@@ -1,16 +1,5 @@
 """
 RegularTask：普通对话任务。
-
-对应 Codex codex-rs/core/src/tasks/regular.rs。
-
-Codex RegularTask::run 的核心是：
-    loop {
-        last_message = run_turn(...).await;
-        if !has_pending_input { return last_message; }
-    }
-
-我们把 run_turn 替换为你已有的 graph.astream()，
-并保留 pending input 循环（steering）。
 """
 from __future__ import annotations
 
@@ -22,7 +11,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from autocoder.models.turn import TurnContext
 from autocoder.tasks.base import SessionTask, TaskKind
 from autocoder.tasks.scheduler import SessionTaskContext
-from dataclasses import asdict
+
 
 class RegularTask(SessionTask):
     """对应 Codex RegularTask。"""
@@ -40,7 +29,6 @@ class RegularTask(SessionTask):
         next_input = user_input
         last_message: Optional[str] = None
 
-        # 对应 Codex 的 loop { run_turn() }
         while True:
             last_message = await self._run_one_turn(
                 session, ctx, next_input, cancel_event
@@ -49,9 +37,6 @@ class RegularTask(SessionTask):
             if cancel_event.is_set():
                 return last_message
 
-            # 处理 pending input（steering）
-            # 这里需要 scheduler 引用，简化处理：由外层 scheduler 控制
-            # 本轮先不在 task 内部取 pending，交给 scheduler.on_finished
             return last_message
 
     async def _run_one_turn(
@@ -65,7 +50,7 @@ class RegularTask(SessionTask):
         session.injected_messages = []
         messages.append(HumanMessage(content=user_input))
 
-        # ★ 不再把 turn_ctx 塞进 state！
+        # ★ 关键：把 turn_id 塞进 state，让 state_machine 感知“这是新一轮”
         state = {
             "messages": messages,
             "tool_call_count": 0,
@@ -74,6 +59,7 @@ class RegularTask(SessionTask):
             "budget_exhausted": False,
             "latest_tool_results": [],
             "guard_retries": 0,
+            "turn_id": ctx.turn_id,   # ← 新增
         }
 
         last_message: Optional[str] = None

@@ -78,14 +78,32 @@ async def create_mcp_tools(session):
 
     @tool
     async def mcp_write_file(file_path: str, content: str) -> str:
-        """Write content to a file, creating parent directories if needed."""
+        """
+        OVERWRITE-write a file. This REPLACES existing file content.
+        For appending content without losing existing data, use mcp_append_file instead.
+        """
         res = await session.call_tool("write_file", arguments={"file_path": file_path, "content": content})
+        return res.content[0].text
+
+    @tool
+    async def mcp_append_file(file_path: str, content: str) -> str:
+        """
+        APPEND content to a file. Creates the file if it does not exist.
+        Use this when you want to add new content while KEEPING existing content.
+        """
+        res = await session.call_tool(
+            "append_file",
+            arguments={"file_path": file_path, "content": content, "add_newline": True},
+        )
         return res.content[0].text
 
     @tool
     async def mcp_apply_patch(file_path: str, original: str, replacement: str) -> str:
         """Apply a targeted patch: replace exact text in a file."""
-        res = await session.call_tool("apply_patch", arguments={"file_path": file_path, "original": original, "replacement": replacement})
+        res = await session.call_tool(
+            "apply_patch",
+            arguments={"file_path": file_path, "original": original, "replacement": replacement},
+        )
         return res.content[0].text
 
     @tool
@@ -94,8 +112,10 @@ async def create_mcp_tools(session):
         res = await session.call_tool("delete_file", arguments={"file_path": file_path})
         return res.content[0].text
 
-    return [mcp_list_dir, mcp_read_file, mcp_search_files, mcp_execute_bash, mcp_write_file, mcp_apply_patch, mcp_delete_file]
-
+    return [
+        mcp_list_dir, mcp_read_file, mcp_search_files, mcp_execute_bash,
+        mcp_write_file, mcp_append_file, mcp_apply_patch, mcp_delete_file,
+    ]
 
 async def read_input(prompt: str = "🧑 You: ") -> str | None:
     def _read():

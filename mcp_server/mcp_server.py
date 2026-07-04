@@ -11,7 +11,6 @@ mcp = FastMCP("AutoCoder-Engine")
 WORKSPACE_DIR = Path(os.getenv("AUTOCODER_WORKSPACE", os.getcwd())).resolve()
 
 # 借鉴 Codex _sandbox.py：3 级沙箱
-# read_only / workspace_write / full_access
 SANDBOX_MODE = os.getenv("AUTOCODER_SANDBOX", "workspace_write")
 
 
@@ -26,7 +25,7 @@ def _resolve(path: str) -> Path:
 def _check_write_permission() -> str | None:
     """检查写权限。返回错误信息或 None（允许）。"""
     if SANDBOX_MODE == "read_only":
-        return "Error: Sandbox is in read-only mode. Write operations are disabled. Set AUTOCODER_SANDBOX=workspace_write in .env to enable."
+        return "Error: Sandbox is in read-only mode. Write operations are disabled."
     return None
 
 
@@ -98,13 +97,11 @@ def execute_bash(command: str, timeout: int = 60) -> str:
     if re.search(r"^\s*(vim|nano|top|less|more|htop)", command):
         return "Error: Interactive commands blocked. Use read_file/write_file instead."
 
-    # 只读模式下阻止写操作命令
     if SANDBOX_MODE == "read_only":
         write_patterns = r"(^|\s)(rm|del|move|mv|cp|mkdir|rmdir|touch|>|>>|tee)\s"
         if re.search(write_patterns, command):
             return "Error: Sandbox is in read-only mode. Destructive/write commands are disabled."
 
-    # 借鉴 autocoder/shell/detect.py：根据平台选择 shell
     if platform.system() == "Windows":
         shell_executable = None
     else:
@@ -130,7 +127,10 @@ def execute_bash(command: str, timeout: int = 60) -> str:
 
 @mcp.tool()
 def write_file(file_path: str, content: str) -> str:
-    """Write content to a file (creates parent dirs)."""
+    """
+    OVERWRITE-write a file (creates parent dirs).
+    ⚠️  This REPLACES existing file content. For appending, use append_file instead.
+    """
     write_err = _check_write_permission()
     if write_err:
         return write_err
@@ -138,7 +138,49 @@ def write_file(file_path: str, content: str) -> str:
         target = _resolve(file_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding='utf-8')
-        return f"Success: Written {file_path} ({len(content)} bytes, {content.count(chr(10))+1} lines)"
+        return f"Success: Written (OVERWRITE) {file_path} ({len(content)} bytes, {content.count(chr(10))+1} lines)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def append_file(file_path: str, content: str, add_newline: bool = True) -> str:
+    """
+    APPEND content to a file (creates the file if not exists).
+    Use this when you want to add content WITHOUT losing existing content.
+
+    Args:
+        file_path: Target file path.
+        content: Text to append.
+        add_newline: If True (default), ensure a newline separator before appending.
+    """
+    write_err = _check_write_permission()
+    if write_err:
+        return write_err
+    try:
+        target = _resolve(file_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        existed = target.exists()
+        existing_size = target.stat().st_size if existed else 0
+
+        # 保证追加前有换行分隔
+        prefix = ""
+        if add_newline and existed and existing_size > 0:
+            with open(target, "rb") as f:
+                f.seek(-1, os.SEEK_END)
+                last_char = f.read(1)
+            if last_char != b"\n":
+                prefix = "\n"
+
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(prefix + content)
+
+        new_size = target.stat().st_size
+        return (
+            f"Success: Appended to {file_path} "
+            f"(+{len(content) + len(prefix)} bytes, total now {new_size} bytes)"
+        )
     except Exception as e:
         return f"Error: {e}"
 
