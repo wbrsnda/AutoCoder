@@ -30,7 +30,20 @@ from autocoder.memory import (
     MemoryInjector, create_memory_tools,
 )
 
+from autocoder.context.token_tracker import TokenTracker
+
 file_tracker = FileTracker()
+
+token_tracker = TokenTracker(
+    model_context_window=Config.MODEL_CONTEXT_WINDOW,
+    auto_compact_ratio=Config.AUTO_COMPACT_TOKEN_RATIO,
+    hard_limit_ratio=Config.HARD_LIMIT_RATIO,
+    max_tool_output_tokens=Config.MAX_TOOL_OUTPUT_TOKENS,
+)
+print(f"🔢 Token: window={Config.MODEL_CONTEXT_WINDOW} "
+      f"compact@{Config.AUTO_COMPACT_TOKEN_RATIO*100:.0f}% "
+      f"hard@{Config.HARD_LIMIT_RATIO*100:.0f}% "
+      f"tool_cap={Config.MAX_TOOL_OUTPUT_TOKENS}")
 
 CONSOLIDATE_EVERY_N_TURNS = 3  # 每 3 个 turn 整合一次
 
@@ -162,11 +175,12 @@ async def main():
             mcp_tools=mcp_tools,
             hook_engine=hook_engine,
             rag_tool=rag_search,
-            memory_tools=mem_tools,          # ★
-            memory_injector=mem_injector,    # ★
+            memory_tools=mem_tools,
+            memory_injector=mem_injector,
             max_tool_calls_per_turn=15,
             workspace_dir=str(workspace),
             file_tracker=file_tracker,
+            token_tracker=token_tracker,   # ★ 新增
         )
 
         from autocoder.tasks import (

@@ -14,10 +14,15 @@ class Config:
     PROXY = os.getenv("PROXY")
     NO_PROXY = os.getenv("NO_PROXY")
 
-    # ── 上下文与安全控制 ──
+    # ── Token 管理（对齐 Codex）──
+    MODEL_CONTEXT_WINDOW = int(os.getenv("MODEL_CONTEXT_WINDOW", "8192"))
+    AUTO_COMPACT_TOKEN_RATIO = float(os.getenv("AUTO_COMPACT_TOKEN_RATIO", "0.75"))
+    HARD_LIMIT_RATIO = float(os.getenv("HARD_LIMIT_RATIO", "0.90"))
+    MAX_TOOL_OUTPUT_TOKENS = int(os.getenv("MAX_TOOL_OUTPUT_TOKENS", "2000"))
+    KEEP_RECENT_MESSAGES = int(os.getenv("KEEP_RECENT_MESSAGES", "10"))
+
+    # 兼容
     OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
-    # 当上下文总字符数超过此门槛时触发实时压缩 (12000字符 ≈ 5500 tokens，为8192预留充足安全空间)
-    COMPRESS_MAX_CHARS = int(os.getenv("COMPRESS_MAX_CHARS", "12000"))
     MAX_GUARD_RETRIES = int(os.getenv("MAX_GUARD_RETRIES", "1"))
 
     @classmethod

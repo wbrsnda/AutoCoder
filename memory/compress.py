@@ -1,19 +1,36 @@
-from langchain_core.messages import SystemMessage, ToolMessage
-from autocoder.utils.config import Config
+"""
+Token 感知的历史压缩 - 对齐 Codex run_pre_sampling_compact + replace_compacted_history
 
-TOOL_MSG_MAX_CHARS = 600
+关键：
+1. 只在 token 超阈值时触发（不再无脑数字符）
+2. 生成 summary 后，使用 RemoveMessage 真正从 LangGraph state 移除旧消息
+3. 记录压缩过程本身的 API usage
+"""
+from __future__ import annotations
+from typing import Optional
+
+from langchain_core.messages import (
+    SystemMessage, ToolMessage, AIMessage, HumanMessage, RemoveMessage
+)
+
+from autocoder.context.token_tracker import (
+    TokenTracker, truncate_text_by_tokens, estimate_message_tokens
+)
+
 SUMMARY_PREFIX = "[Session Summary]"
+TOOL_MSG_TOKEN_CAP = 400  # 压缩时保留的工具输出上限
 
 
 def is_summary_message(msg) -> bool:
     return isinstance(msg, SystemMessage) and str(msg.content).startswith(SUMMARY_PREFIX)
 
 
-def truncate_tool_message(msg: ToolMessage) -> ToolMessage:
+def _truncate_tool_for_summary(msg: ToolMessage) -> ToolMessage:
+    """压缩前先把超长工具输出裁短，减少 summary LLM 调用成本"""
     content = str(msg.content)
-    if len(content) <= TOOL_MSG_MAX_CHARS:
+    truncated, was_cut = truncate_text_by_tokens(content, TOOL_MSG_TOKEN_CAP)
+    if not was_cut:
         return msg
-    truncated = f"{content[:400]}\n...[Truncated {len(content)} chars]...\n{content[-150:]}"
     return ToolMessage(
         content=truncated,
         tool_call_id=msg.tool_call_id,
@@ -21,56 +38,99 @@ def truncate_tool_message(msg: ToolMessage) -> ToolMessage:
     )
 
 
-async def compress_history(messages: list, llm, threshold: int = 24, keep_recent: int = 10) -> list:
-    total_chars = sum(len(str(getattr(m, "content", "")) or "") for m in messages)
-    
-    # ★ 双重触发门槛：条数超过 threshold OR 字符总量超过 COMPRESS_MAX_CHARS
-    need_compress = (len(messages) > threshold) or (total_chars > Config.COMPRESS_MAX_CHARS)
-    print(f"🔎 [CompressCheck] msgs={len(messages)}/{threshold} chars={total_chars}/{Config.COMPRESS_MAX_CHARS} trigger={need_compress}")
+SUMMARY_SYSTEM_PROMPT = (
+    "You are a session summarizer for a coding assistant.\n"
+    "Produce a concise but complete summary preserving:\n"
+    "1. The user's original goal\n"
+    "2. Every important tool call and its outcome (success/failure)\n"
+    "3. Files read / modified with exact paths\n"
+    "4. Key decisions and current progress\n"
+    "5. Any errors encountered and their causes\n"
+    "Format as structured markdown. Keep under 800 tokens."
+)
 
-    if not need_compress:
-        return messages
 
+async def compress_history_if_needed(
+    messages: list,
+    llm,
+    token_tracker: TokenTracker,
+    keep_recent: int = 10,
+) -> tuple[list, list, bool]:
+    """
+    核心压缩函数。
+
+    返回:
+      (updates_for_state, prompt_messages, was_compressed)
+      - updates_for_state: 要写回 LangGraph state 的 message 增量（含 RemoveMessage）
+      - prompt_messages:   本次 ainvoke 实际用的 messages（已压缩）
+      - was_compressed:    是否真的压缩了
+
+    如果没触发压缩：updates_for_state=[], prompt_messages=messages
+    """
+    if not token_tracker.should_compact(messages):
+        return [], messages, False
+
+    hard = token_tracker.is_hard_limit_reached(messages)
+    print(f"{'🔴' if hard else '🟡'} [Compact] Trigger "
+          f"({'HARD LIMIT' if hard else 'soft threshold'})")
+
+    # ── 划分 keep / drop ──
     sys_msgs = [m for m in messages if isinstance(m, SystemMessage) and not is_summary_message(m)]
+    summary_msgs = [m for m in messages if is_summary_message(m)]
     non_sys = [m for m in messages if not isinstance(m, SystemMessage)]
+
     if len(non_sys) <= keep_recent:
-        return messages
+        return [], messages, False
 
-    old_msgs = non_sys[:-keep_recent]
-    recent_msgs = non_sys[-keep_recent:]
-    if not old_msgs:
-        return messages
+    old = non_sys[:-keep_recent]
+    recent = non_sys[-keep_recent:]
 
-    filtered_old = []
-    for m in old_msgs:
+    # ── 准备用于 summary 的输入（工具消息裁短）──
+    old_for_summary = []
+    for m in old:
         if isinstance(m, ToolMessage):
-            content_str = str(m.content)
-            if any(k in content_str for k in ["mcp_read_file", "class ", "def ", "[Already read]"]):
-                filtered_old.append(m)
-            else:
-                filtered_old.append(truncate_tool_message(m))
+            old_for_summary.append(_truncate_tool_for_summary(m))
         else:
-            filtered_old.append(m)
+            old_for_summary.append(m)
 
-    summary_prompt = SystemMessage(content=(
-        "You are a session summarizer for a coding assistant.\n"
-        "Summarize the conversation and preserve:\n"
-        "1. The user's original goal\n"
-        "2. Completed steps and every important tool call\n"
-        "3. Files read / modified with exact paths\n"
-        "4. Current progress and decisions\n"
-        "5. Important findings for future continuation\n"
-    ))
-
+    # ── 调 LLM 生成 summary ──
+    summary_text: str
     try:
-        print("🗜️ [Memory] Compressing old history...")
-        res = await llm.ainvoke([summary_prompt] + filtered_old)
-        compressed = SystemMessage(content=f"{SUMMARY_PREFIX}\n{str(res.content)}")
+        print("🗜️ [Compact] Generating summary...")
+        res = await llm.ainvoke([
+            SystemMessage(content=SUMMARY_SYSTEM_PROMPT),
+            *old_for_summary,
+        ])
+        summary_text = str(res.content).strip()
+        # 压缩本身也消耗 token，记录进 tracker
+        token_tracker.record_ai_message(res)
     except Exception as e:
-        print(f"⚠️ [Memory] Compression failed: {e}")
-        compressed = SystemMessage(content=f"{SUMMARY_PREFIX}\n[Previous {len(old_msgs)} messages summarized after failure]")
+        print(f"⚠️ [Compact] Summary failed: {e}")
+        summary_text = f"[Auto-summary of {len(old)} previous messages failed: {e}]"
 
-    result_msgs = sys_msgs + [compressed] + recent_msgs
-    after_chars = sum(len(str(getattr(m, "content", "")) or "") for m in result_msgs)
-    print(f"✅ [Memory] Compressed from {len(messages)} msgs ({total_chars} chars) to {len(result_msgs)} msgs ({after_chars} chars)")
-    return result_msgs
+    compressed_summary = SystemMessage(
+        content=f"{SUMMARY_PREFIX}\n{summary_text}"
+    )
+
+    # ── 组装 LangGraph state 更新 ──
+    # 用 RemoveMessage 干掉旧的 (包括旧 summary)，追加新 summary
+    updates: list = []
+    for m in old:
+        mid = getattr(m, "id", None)
+        if mid:
+            updates.append(RemoveMessage(id=mid))
+    for m in summary_msgs:
+        mid = getattr(m, "id", None)
+        if mid:
+            updates.append(RemoveMessage(id=mid))
+    updates.append(compressed_summary)
+
+    # ── prompt_messages: 本次 ainvoke 实际用 ──
+    prompt_messages = sys_msgs + [compressed_summary] + recent
+
+    before_total = token_tracker.estimate_total(messages)
+    after_total = token_tracker.estimate_total(prompt_messages)
+    print(f"✅ [Compact] {before_total:,} → {after_total:,} tokens "
+          f"({len(messages)} → {len(prompt_messages)} msgs)")
+
+    return updates, prompt_messages, True
