@@ -24,13 +24,13 @@ from autocoder.rag.retriever import rag_search
 from autocoder.orchestrator.hook_engine import HookEngine, HookEvent, Rule, Condition, HookAction
 from autocoder.context.file_tracker import FileTracker
 
-# ★ Memory imports
 from autocoder.memory import (
     MemoryWorkspace, MemoryRecorder, MemoryConsolidator,
     MemoryInjector, create_memory_tools,
 )
 
 from autocoder.context.token_tracker import TokenTracker
+from autocoder.harness import AuditLogger, PermissionPolicy
 
 file_tracker = FileTracker()
 
@@ -45,7 +45,7 @@ print(f"🔢 Token: window={Config.MODEL_CONTEXT_WINDOW} "
       f"hard@{Config.HARD_LIMIT_RATIO*100:.0f}% "
       f"tool_cap={Config.MAX_TOOL_OUTPUT_TOKENS}")
 
-CONSOLIDATE_EVERY_N_TURNS = 3  # 每 3 个 turn 整合一次
+CONSOLIDATE_EVERY_N_TURNS = 3
 
 
 async def create_mcp_tools(session):
@@ -117,6 +117,7 @@ async def create_mcp_tools(session):
         mcp_write_file, mcp_append_file, mcp_apply_patch, mcp_delete_file,
     ]
 
+
 async def read_input(prompt: str = "🧑 You: ") -> str | None:
     def _read():
         try:
@@ -127,7 +128,7 @@ async def read_input(prompt: str = "🧑 You: ") -> str | None:
 
 
 async def main():
-    print("🚀 AutoCoder v6 Starting (Pure file-based memory)...")
+    print("🚀 AutoCoder v7 Starting (Tool Harness enabled)...")
     Config.apply_proxy()
 
     workspace = Config.WORKSPACE_DIR
@@ -162,6 +163,14 @@ async def main():
             message="[Fallback] Dangerous 'rm -rf' blocked.",
         ))
 
+        # ★★★ Harness 装配 ★★★
+        audit_logger = AuditLogger(log_dir=workspace / ".autocoder" / "audit")
+        permission_policy = PermissionPolicy.from_sandbox_mode(
+            os.getenv("AUTOCODER_SANDBOX", "workspace_write")
+        )
+        print(f"🛡️  Sandbox: {permission_policy.max_level.name} "
+              f"| Audit: {workspace / '.autocoder' / 'audit'}")
+
         architect_llm = ChatOpenAI(
             model=Config.ARCHITECT_MODEL,
             api_key=Config.LLM_API_KEY,
@@ -175,7 +184,6 @@ async def main():
             temperature=0.0,
         )
 
-        # ★★★ Memory 初始化（纯文件，无 SQLite，无 ChromaDB）★★★
         mem_workspace = MemoryWorkspace(workspace)
         mem_workspace.ensure_initialized()
         mem_recorder = MemoryRecorder(mem_workspace)
@@ -200,7 +208,9 @@ async def main():
             max_tool_calls_per_turn=15,
             workspace_dir=str(workspace),
             file_tracker=file_tracker,
-            token_tracker=token_tracker,   # ★ 新增
+            token_tracker=token_tracker,
+            audit_logger=audit_logger,            # ★
+            permission_policy=permission_policy,  # ★
         )
 
         from autocoder.tasks import (
@@ -249,7 +259,6 @@ async def main():
                         print("\n⚠️ Ctrl+C interrupting...")
                         await scheduler.abort_all_tasks(TurnAbortReason.INTERRUPTED)
 
-                # ★★★ Turn 结束 - 记录 + 周期性整合 ★★★
                 if ctx.status == TurnStatus.COMPLETED:
                     new_tools = [
                         {"tool_name": r.tool_name, "tool_args": {}, "success": r.success}
@@ -261,7 +270,6 @@ async def main():
                         tool_calls=new_tools,
                     )
 
-                    # 每 N 个 turn 整合一次
                     if mem_recorder.turn_count > 0 and mem_recorder.turn_count % CONSOLIDATE_EVERY_N_TURNS == 0:
                         print(f"\n🧠 [Memory] Triggering consolidation (turn {mem_recorder.turn_count})...")
                         try:

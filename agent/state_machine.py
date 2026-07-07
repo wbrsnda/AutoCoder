@@ -1,11 +1,12 @@
 import asyncio
+import os
 import platform
 import ast
 import re
-from typing import Annotated, TypedDict, Optional
+from typing import Annotated, TypedDict
 
 from langchain_core.messages import (
-    HumanMessage, SystemMessage, ToolMessage, AIMessage, RemoveMessage
+    HumanMessage, SystemMessage, ToolMessage, AIMessage,
 )
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
@@ -16,11 +17,15 @@ from autocoder.memory.compress import compress_history_if_needed
 from autocoder.context.token_tracker import (
     TokenTracker, truncate_text_by_tokens, estimate_message_tokens
 )
-from autocoder.orchestrator.hook_engine import HookEngine, HookEvent
+from autocoder.orchestrator.hook_engine import HookEngine
 from autocoder.skills.builtin import match_skill
 from autocoder.context.file_tracker import FileTracker
-from autocoder.models.turn import TurnContext, TurnStatus, TurnPhase
+from autocoder.models.turn import TurnContext, TurnPhase
 from autocoder.utils.config import Config
+from autocoder.harness import (
+    ToolInvoker, PermissionPolicy, TelemetryCollector,
+    AuditLogger, ContextGateway, PlannerGuard,
+)
 
 OS_NAME = platform.system()
 ROLE_ARCHITECT = "architect"
@@ -36,11 +41,11 @@ class AgentState(TypedDict):
     budget_exhausted: bool
     latest_tool_results: list
     guard_retries: int
-    turn_id: str  # ★ 新增：用于识别新 turn
+    turn_id: str
 
 
 # ══════════════════════════════════════════════════════
-# 辅助函数（未改动，直接保留）
+# 辅助函数（保留原实现）
 # ══════════════════════════════════════════════════════
 def _strip_line_numbers(text: str) -> str:
     cleaned = []
@@ -125,6 +130,18 @@ def _build_deterministic_report(delegation: str, latest_tool_results: list) -> s
         tool_name = item.get("tool_name", "unknown")
         tool_args = item.get("tool_args", {}) or {}
         content = item.get("content", "")
+        success = item.get("success", not str(content).startswith("Error"))
+
+        # ★ 失败结果优先按失败处理，避免把 Duplicate/Error 当成空目录解析
+        if not success or str(content).startswith("Error"):
+            issues.append(str(content)[:300])
+            body.append(
+                f"### 工具调用失败\n"
+                f"- Tool: {tool_name}\n"
+                f"- Args: {tool_args}\n"
+                f"- Error:\n{str(content)[:1000]}"
+            )
+            continue
 
         if tool_name == "mcp_list_dir":
             body.append(_summarize_list_dir(content))
@@ -137,13 +154,17 @@ def _build_deterministic_report(delegation: str, latest_tool_results: list) -> s
             files_modified.append(fp)
             verb = "写入" if tool_name == "mcp_write_file" else "追加"
             body.append(f"### {verb}文件结果\n- 目标: {fp}\n- 工具返回: {content}")
+        elif tool_name == "mcp_apply_patch":
+            fp = tool_args.get("file_path", "unknown")
+            files_modified.append(fp)
+            body.append(f"### Patch 结果\n- 目标: {fp}\n- 工具返回: {content}")
         elif tool_name in ("memories_search", "memories_read", "memories_list", "add_ad_hoc_note"):
             body.append(f"### Memory 结果\n- Tool: {tool_name}\n- Args: {tool_args}\n- Output:\n{content[:3000]}")
         else:
             body.append(f"### 工具结果\n- Tool: {tool_name}\n- Args: {tool_args}\n- Content:\n{content[:4000]}")
 
-        if isinstance(content, str) and content.startswith("Error:"):
-            issues.append(content)
+        if not success:
+            issues.append(str(content)[:300])
 
     parts.append(f"- **Files Read**: {', '.join(files_read) if files_read else 'None'}")
     parts.append(f"- **Files Modified**: {', '.join(files_modified) if files_modified else 'None'}")
@@ -168,6 +189,8 @@ def build_graph(
     workspace_dir: str = ".",
     file_tracker: FileTracker = None,
     token_tracker: TokenTracker = None,
+    audit_logger: AuditLogger = None,
+    permission_policy: PermissionPolicy = None,
 ):
     if hook_engine is None:
         hook_engine = HookEngine()
@@ -182,19 +205,52 @@ def build_graph(
             hard_limit_ratio=Config.HARD_LIMIT_RATIO,
             max_tool_output_tokens=Config.MAX_TOOL_OUTPUT_TOKENS,
         )
+    if permission_policy is None:
+        permission_policy = PermissionPolicy.from_sandbox_mode(
+            os.getenv("AUTOCODER_SANDBOX", "workspace_write")
+        )
 
     all_tools = mcp_tools + ([rag_tool] if rag_tool else []) + memory_tools
     architect_bound = architect_llm
-    coder_bound = coder_llm.bind_tools(all_tools)
     tool_map = {t.name: t for t in all_tools}
 
-    # ── Turn 上下文：每个 user turn 独立一份 ──
-    turn_state = {
-        "ctx": TurnContext(max_tool_calls=max_tool_calls_per_turn)
-    }
+    # ── Harness 装配 ──
+    def _read_summarizer(fp: str, content: str) -> str:
+        if fp.endswith(".py"):
+            return _summarize_python_file(fp, content)
+        return f"{len(content.splitlines())} lines"
+
+    invoker = ToolInvoker(
+        tool_map=tool_map,
+        permission_policy=permission_policy,
+        hook_engine=hook_engine,
+        file_tracker=file_tracker,
+        audit_logger=audit_logger,
+        default_timeout=90.0,
+        max_retries=1,
+        read_summarizer=_read_summarizer,
+    )
+    gateway = ContextGateway(all_tools)
+    planner_guard = PlannerGuard(
+    tool_names=[t.name for t in all_tools],
+    file_tracker=file_tracker,
+    )
+
+    # per-turn telemetry（带上限清理，防内存泄漏）
+    turn_telemetry: dict = {}
+
+    def _get_telemetry(turn_id: str) -> TelemetryCollector:
+        if turn_id not in turn_telemetry:
+            if len(turn_telemetry) > 8:
+                oldest = next(iter(turn_telemetry))
+                turn_telemetry.pop(oldest, None)
+            turn_telemetry[turn_id] = TelemetryCollector(trace_id=turn_id or None)
+        return turn_telemetry[turn_id]
+
+    # ── Turn 上下文 ──
+    turn_state = {"ctx": TurnContext(max_tool_calls=max_tool_calls_per_turn)}
 
     def _ensure_fresh_turn_ctx(state_turn_id: str) -> None:
-        """若 state 里的 turn_id 与当前不同，重建一个干净的 TurnContext"""
         current_ctx = turn_state["ctx"]
         if state_turn_id and state_turn_id != current_ctx.turn_id:
             print(f"🔄 [TurnCtx] Reset {current_ctx.turn_id} → {state_turn_id}")
@@ -240,7 +296,36 @@ def build_graph(
              if isinstance(m, HumanMessage) and getattr(m, "name", "") != "SystemRuntime"),
             "",
         )
-        skill = match_skill(last_user)
+
+        # 判断当前是否是 Coder Report 回流到 Architect
+        last_msg = raw_msgs[-1] if raw_msgs else None
+        last_content = getattr(last_msg, "content", "") or ""
+        has_coder_report = isinstance(last_msg, AIMessage) and str(last_content).lstrip().startswith("REPORT TO ARCHITECT")
+
+        # ★ PlannerGuard：高置信度工具需求，直接强制 delegate，避免 Architect 假装“正在查”
+        forced_delegation = planner_guard.pre_delegate(
+            user_text=last_user,
+            has_coder_report=has_coder_report,
+        )
+        if forced_delegation:
+            content = f"DELEGATE TO CODER: {forced_delegation}"
+            msg = AIMessage(content=content)
+            turn_ctx.phase = TurnPhase.DELEGATION
+
+            print(f"\n🛡️  [PlannerGuard] Forced delegation:\n{content}\n")
+
+            return {
+                "messages": remove_updates + [msg],
+                "current_role": ROLE_ARCHITECT,
+                "delegation": forced_delegation,
+                "tool_call_count": 0,
+                "budget_exhausted": False,
+                "latest_tool_results": [],
+                "guard_retries": 0,
+            }
+
+        # Coder report 回来后，不再注入 skill，避免再次触发同一技能导致循环
+        skill = None if has_coder_report else match_skill(last_user)
 
         project_ctx = f"\n\n[WORKSPACE]: {workspace_dir}\n[OS]: {OS_NAME}"
         context_summary = file_tracker.build_context_summary()
@@ -262,6 +347,17 @@ def build_graph(
         _record_usage(res)
 
         content = (res.content or "").strip()
+
+        # ★ PlannerGuard：修正 Architect 违规输出
+        normalized = planner_guard.normalize_architect_output(
+            user_text=last_user,
+            content=content,
+            has_coder_report=has_coder_report,
+        )
+        if normalized != content:
+            print(f"🛡️  [PlannerGuard] Architect output normalized:\nFROM:\n{content}\nTO:\n{normalized}\n")
+            content = normalized
+            res = AIMessage(content=content)
 
         guard_retries = state.get("guard_retries", 0)
         if not content or content == "None":
@@ -296,12 +392,20 @@ def build_graph(
         if "DELEGATE TO CODER:" in content:
             raw = content.split("DELEGATE TO CODER:", 1)[-1].strip()
             delegation = raw.split("AWAITING USER INPUT")[0].strip()
+            # 不再强行只取第一行：
+            # mcp_write_file / mcp_append_file / mcp_apply_patch 可能携带多行内容。
             turn_ctx.phase = TurnPhase.DELEGATION
 
-        if "AWAITING USER INPUT" in content:
+        if "AWAITING USER INPUT" in content and not delegation:
             turn_ctx.complete(content)
             print(f"📊 {turn_ctx.to_event()}")
             print(token_tracker.format_audit_panel())
+            tel = turn_telemetry.get(turn_ctx.turn_id)
+            if tel and tel.spans:
+                summary = tel.summarize()
+                print(f"🔭 [Harness] calls={summary['total_calls']} "
+                      f"total={summary['total_duration_ms']}ms "
+                      f"status={summary['by_status']}")
 
         return {
             "messages": remove_updates + [res],
@@ -314,7 +418,7 @@ def build_graph(
         }
 
     # ══════════════════════════════════════════════════
-    # CODER NODE
+    # CODER NODE（★ Gateway 按需暴露工具）
     # ══════════════════════════════════════════════════
     async def coder_node(state: AgentState) -> dict:
         raw_msgs = state["messages"]
@@ -331,12 +435,35 @@ def build_graph(
         delegation = state.get("delegation", "")
         turn_ctx.phase = TurnPhase.EXECUTION
 
+        # ★ Deterministic ToolCall Fast Path
+        # 对简单明确的 delegation，直接生成 tool_call，不再依赖 Coder 模型的 function calling 稳定性。
+        deterministic_call = planner_guard.parse_delegation_to_tool_call(delegation)
+        if deterministic_call and deterministic_call["name"] in tool_map:
+            ai = AIMessage(content="", tool_calls=[deterministic_call])
+            print(f"\n🧭 [PlannerGuard] Deterministic tool_call:\n{deterministic_call}\n")
+            return {
+                "messages": remove_updates + [ai],
+                "current_role": ROLE_CODER,
+            }
+
+        # ★ Gateway 按需选择工具
+        visible_tools = gateway.select_for_delegation(delegation)
+        coder_bound_dyn = coder_llm.bind_tools(visible_tools)
+        visible_manifest = gateway.build_visible_manifest(visible_tools)
+
+        if len(visible_tools) < len(all_tools):
+            print(f"🚪 [Gateway] Exposing {len(visible_tools)}/{len(all_tools)} tools")
+
         sys_content = CODER_SYSTEM + f"\n\n[WORKSPACE]: {workspace_dir}\n[OS]: {OS_NAME}"
         if delegation:
             sys_content += f"\n\n[CURRENT TASK FROM ARCHITECT]: {delegation}"
+
+        sys_content += "\n\n" + visible_manifest
+
         context_summary = file_tracker.build_context_summary()
         if context_summary:
             sys_content += "\n" + context_summary
+
         sys_content += (
             "\n\n[PHASE]: TOOL EXECUTION PHASE.\n"
             "Your job is to call the required tool(s). Match the tool name in the task.\n"
@@ -348,16 +475,30 @@ def build_graph(
         clean = [m for m in prompt_msgs if not isinstance(m, SystemMessage)]
         msgs = [SystemMessage(content=sys_content)] + clean
 
-        res = await coder_bound.ainvoke(msgs)
+        res = await coder_bound_dyn.ainvoke(msgs)
         _record_usage(res)
 
         content = (res.content or "").strip()
         if content:
-            print(f"\n💻 Coder:\n{content}\n")
+            print(f"\n💻 Coder:\n{content[:400]}{'...' if len(content) > 400 else ''}\n")
         else:
             print("\n🔧 Coder: thinking...")
+
+        # ★ Coder Fallback：LLM 未产出 tool_calls 时，兜底再尝试确定性解析
+        if not res.tool_calls and delegation:
+            fallback_call = planner_guard.parse_delegation_to_tool_call(delegation)
+            if fallback_call and fallback_call["name"] in tool_map:
+                print(f"🧭 [PlannerGuard] Coder LLM failed, using deterministic fallback → {fallback_call['name']}")
+                ai = AIMessage(content="", tool_calls=[fallback_call])
+                return {
+                    "messages": remove_updates + [ai],
+                    "current_role": ROLE_CODER,
+                }
+
         if res.tool_calls:
             print(f"🛠️  Tools: {[tc['name'] for tc in res.tool_calls]}")
+        else:
+            print("⚠️  [CoderGuard] Coder returned no tool_calls AND no fallback matched. Routing back to Architect.")
 
         return {
             "messages": remove_updates + [res],
@@ -365,149 +506,53 @@ def build_graph(
         }
 
     # ══════════════════════════════════════════════════
-    # HOOKED TOOLS NODE
+    # HOOKED TOOLS NODE（★ 全部走 Invoker 执行闭环）
     # ══════════════════════════════════════════════════
     async def hooked_tools_node(state: AgentState) -> dict:
         last_msg = state["messages"][-1]
         if not getattr(last_msg, "tool_calls", None):
             return {"messages": [], "latest_tool_results": []}
 
-        async def execute_single(tool_call):
-            tool_name = tool_call["name"]
-            tool_args = tool_call.get("args", {}) or {}
-            call_id = tool_call["id"]
+        turn_id = state.get("turn_id", "") or _get_ctx().turn_id
+        telemetry = _get_telemetry(turn_id)
 
+        # 组装调用（保留原有的 file_path 兜底行为）
+        calls = []
+        for tc in last_msg.tool_calls:
+            tool_name = tc["name"]
+            tool_args = dict(tc.get("args", {}) or {})
             if tool_name in ("mcp_write_file", "mcp_append_file") and "file_path" not in tool_args:
                 tool_args["file_path"] = "new_script.py"
+            calls.append((tool_name, tool_args))
 
-            # 去重：只对 mcp 工具做去重
-            if tool_name.startswith("mcp_") and file_tracker.is_duplicate_call(tool_name, tool_args):
-                msg = f"[Duplicate call skipped] {tool_name}"
-                return (
-                    ToolMessage(content=msg, tool_call_id=call_id),
-                    {"tool_name": tool_name, "tool_args": tool_args, "content": msg},
-                )
+        results = await invoker.invoke_many(calls, telemetry)
 
-            # 已读文件复用摘要
-            if tool_name == "mcp_read_file":
-                fp = tool_args.get("file_path", "")
-                snap = file_tracker._files.get(fp)
-                if snap and snap.was_read and not snap.is_stale:
-                    summary = file_tracker.get_file_summary(fp)
-                    msg = f"[Already read] {fp}. Summary: {summary}."
-                    return (
-                        ToolMessage(content=msg, tool_call_id=call_id),
-                        {"tool_name": tool_name, "tool_args": tool_args, "content": msg},
-                    )
+        tool_msgs = []
+        tool_results = []
+        for tc, result in zip(last_msg.tool_calls, results):
+            content = result.to_tool_message_content()
 
-            # Hook: PreToolUse
-            hook_ctx = {"tool_name": tool_name, **tool_args}
-            hook_result = hook_engine.evaluate(
-                HookEvent.PRE_TOOL_USE,
-                tool_name=tool_name,
-                context=hook_ctx,
-            )
-            if hook_result.should_block:
-                msg = f"Blocked: {hook_result.block_reason}"
-                return (
-                    ToolMessage(content=msg, tool_call_id=call_id),
-                    {"tool_name": tool_name, "tool_args": tool_args, "content": msg},
-                )
-
-            if tool_name not in tool_map:
-                msg = f"Tool not found: {tool_name}"
-                return (
-                    ToolMessage(content=msg, tool_call_id=call_id),
-                    {"tool_name": tool_name, "tool_args": tool_args, "content": msg},
-                )
-
-            # 真正执行工具
-            try:
-                tool_obj = tool_map[tool_name]
-                result = (
-                    await tool_obj.ainvoke(tool_args)
-                    if hasattr(tool_obj, "ainvoke")
-                    else tool_obj.invoke(tool_args)
-                )
-                result_str = str(result)
-            except Exception as e:
-                result_str = f"Error: {e}"
-
-            # 工具输出 Token 截断
-            original_tokens = estimate_message_tokens(
-                ToolMessage(content=result_str, tool_call_id=call_id)
-            )
-            if original_tokens > token_tracker.max_tool_output_tokens:
+            # ★ 保留原有 token 截断（自愈建议一并计入长度）
+            probe = ToolMessage(content=content, tool_call_id=tc["id"])
+            if estimate_message_tokens(probe) > token_tracker.max_tool_output_tokens:
                 truncated, was_cut = truncate_text_by_tokens(
-                    result_str,
-                    token_tracker.max_tool_output_tokens,
+                    content, token_tracker.max_tool_output_tokens
                 )
                 if was_cut:
-                    print(
-                        f"✂️  [ToolTruncate] {tool_name}: "
-                        f"~{original_tokens} → ~{token_tracker.max_tool_output_tokens} tokens"
-                    )
-                    result_str = truncated
+                    print(f"✂️  [ToolTruncate] {result.tool_name}")
+                    content = truncated
 
-            # ============================================================
-            # 文件跟踪：注意这里必须和 token 截断 if 平级，不能缩进到里面
-            # ============================================================
-            if tool_name.startswith("mcp_"):
-                file_tracker.record_tool_call(
-                    tool_name,
-                    tool_args,
-                    result_preview=result_str[:200],
-                    success=not result_str.startswith("Error:"),
-                )
+            tool_msgs.append(ToolMessage(content=content, tool_call_id=tc["id"]))
+            tool_results.append({
+                "tool_name": result.tool_name,
+                "tool_args": result.args,
+                "content": result.content,
+                "success": result.success,
+                "duration_ms": result.span.duration_ms,
+            })
 
-                if tool_name == "mcp_read_file" and not result_str.startswith("Error:"):
-                    fp = tool_args.get("file_path", "unknown")
-                    summary = (
-                        _summarize_python_file(fp, result_str)
-                        if fp.endswith(".py")
-                        else f"{len(result_str.splitlines())} lines"
-                    )
-                    file_tracker.record_file_read(fp, result_str, summary[:500])
-
-                elif tool_name == "mcp_list_dir" and not result_str.startswith("Error:"):
-                    file_tracker.record_dir_listing(
-                        tool_args.get("directory", "."),
-                        result_str,
-                    )
-
-                elif tool_name == "mcp_write_file" and not result_str.startswith("Error:"):
-                    fp = tool_args.get("file_path", "")
-                    if fp:
-                        file_tracker.record_file_modified(fp)
-
-                elif tool_name == "mcp_append_file" and not result_str.startswith("Error:"):
-                    fp = tool_args.get("file_path", "")
-                    if fp:
-                        file_tracker.record_file_appended(fp)
-
-                elif tool_name == "mcp_apply_patch" and not result_str.startswith("Error:"):
-                    fp = tool_args.get("file_path", "")
-                    if fp:
-                        file_tracker.record_file_modified(fp)
-
-                elif tool_name == "mcp_delete_file" and not result_str.startswith("Error:"):
-                    fp = tool_args.get("file_path", "")
-                    if fp:
-                        file_tracker.record_file_deleted(fp)
-
-            # Hook: PostToolUse
-            hook_engine.evaluate(
-                HookEvent.POST_TOOL_USE,
-                tool_name=tool_name,
-                context={**hook_ctx, "result": result_str[:300]},
-            )
-
-            return (
-                ToolMessage(content=result_str, tool_call_id=call_id),
-                {"tool_name": tool_name, "tool_args": tool_args, "content": result_str},
-            )
-
-        results = await asyncio.gather(*[execute_single(tc) for tc in last_msg.tool_calls])
+        # 可观测性输出
+        print("\n" + telemetry.format_table())
         stats = file_tracker.get_stats()
         print(
             f"📊 [Context] files_read={stats['files_read']}, "
@@ -517,12 +562,12 @@ def build_graph(
         )
 
         return {
-            "messages": [x[0] for x in results],
-            "latest_tool_results": [x[1] for x in results],
+            "messages": tool_msgs,
+            "latest_tool_results": tool_results,
         }
 
     # ══════════════════════════════════════════════════
-    # BUDGET / REPORT NODES
+    # BUDGET / REPORT NODES（保留原实现）
     # ══════════════════════════════════════════════════
     async def budget_node(state: AgentState) -> dict:
         turn_ctx = _get_ctx()
@@ -548,7 +593,7 @@ def build_graph(
         return {"messages": [AIMessage(content=report)], "current_role": ROLE_CODER_REPORT}
 
     # ══════════════════════════════════════════════════
-    # ROUTING
+    # ROUTING（保留原实现）
     # ══════════════════════════════════════════════════
     def route_after_architect(state):
         last_msg = state["messages"][-1]

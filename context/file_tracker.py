@@ -246,7 +246,11 @@ class FileTracker:
 
     def build_context_summary(self) -> str:
         """
-        生成当前上下文摘要，注入到 Architect 的 System Prompt 中。
+        生成当前上下文摘要，注入到 Architect / Coder 的 System Prompt 中。
+
+        修复点：
+        - 不再只写 "Already listed directories: ."
+        - 会带上目录缓存中的文件名，避免模型忘记 project_experience.tex 这种文件。
         """
         if not self._files and not self._dir_listings:
             return ""
@@ -281,9 +285,28 @@ class FileTracker:
             for path, snap in changed_unread_files.items():
                 parts.append(f"  - {path} [⚠️ {snap.change_type}] ({snap.summary})")
 
+        # ★ 增强：注入已列目录的实际文件名
         if self._dir_listings:
-            dirs = list(self._dir_listings.keys())
-            parts.append(f"Already listed directories: {', '.join(dirs)}")
+            parts.append("Already listed directories and visible entries:")
+            for directory, (content, ts) in self._dir_listings.items():
+                files, dirs = [], []
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line.startswith("[FILE] "):
+                        files.append(line.replace("[FILE] ", "", 1))
+                    elif line.startswith("[DIR] "):
+                        dirs.append(line.replace("[DIR] ", "", 1))
+
+                dir_label = directory or "."
+                parts.append(f"  - {dir_label}:")
+                if dirs:
+                    parts.append(f"    dirs: {', '.join(dirs[:20])}")
+                if files:
+                    parts.append(f"    files: {', '.join(files[:40])}")
+                    if len(files) > 40:
+                        parts.append(f"    ... (+{len(files) - 40} more files)")
+                if not dirs and not files:
+                    parts.append("    (empty or no visible entries)")
 
         parts.append(
             "If you need updated content of a MODIFIED/APPENDED file, "
