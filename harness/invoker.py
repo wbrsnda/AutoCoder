@@ -113,19 +113,31 @@ class ToolInvoker:
                 )
 
         # ★ 只做 turn 内去重，不再跨 turn 去重
+        # 但 mcp_read_file 如果文件已被修改 → 允许重新读
         if self._is_duplicate_in_current_turn(telemetry, tool_name, args):
-            msg = f"Error: [Duplicate call skipped in current turn] {tool_name}"
-            span.finish(SpanStatus.BLOCKED, result=msg, error=msg)
-            self._log(span)
-            return InvocationResult(
-                tool_name=tool_name,
-                args=args,
-                content=msg,
-                success=False,
-                span=span,
-                blocked=True,
-                heal=self.healer.analyze(tool_name, args, msg),
-            )
+            if tool_name == "mcp_read_file" and self.file_tracker:
+                fp = args.get("file_path", "")
+                snap = self.file_tracker._files.get(fp)
+                if snap and snap.is_stale:
+                    pass  # 文件已修改，允许重新读
+                else:
+                    msg = f"Error: [Duplicate call skipped in current turn] {tool_name}"
+                    span.finish(SpanStatus.BLOCKED, result=msg, error=msg)
+                    self._log(span)
+                    return InvocationResult(
+                        tool_name=tool_name, args=args, content=msg,
+                        success=False, span=span, blocked=True,
+                        heal=self.healer.analyze(tool_name, args, msg),
+                    )
+            else:
+                msg = f"Error: [Duplicate call skipped in current turn] {tool_name}"
+                span.finish(SpanStatus.BLOCKED, result=msg, error=msg)
+                self._log(span)
+                return InvocationResult(
+                    tool_name=tool_name, args=args, content=msg,
+                    success=False, span=span, blocked=True,
+                    heal=self.healer.analyze(tool_name, args, msg),
+                )
 
         # PreToolUse Hook
         if self.hook_engine:

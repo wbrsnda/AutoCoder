@@ -233,8 +233,16 @@ def build_graph(
         )
 
     all_tools = mcp_tools + ([rag_tool] if rag_tool else []) + memory_tools
-    architect_bound = architect_llm
     tool_map = {t.name: t for t in all_tools}
+
+    # Architect 只读工具集 — 可直接读文件，不委派 Coder
+    ARCHITECT_READONLY_NAMES = {
+        "mcp_list_dir", "mcp_read_file", "mcp_find_files", "mcp_search_files",
+        "mcp_git_status", "mcp_git_diff", "rag_search",
+        "memories_search", "memories_read", "memories_list",
+    }
+    architect_readonly_tools = [t for t in all_tools if t.name in ARCHITECT_READONLY_NAMES]
+    architect_bound = architect_llm.bind_tools(architect_readonly_tools)
 
     # ── Harness 装配 ──
     def _read_summarizer(fp: str, content: str) -> str:
@@ -367,6 +375,19 @@ def build_graph(
 
         res = await architect_bound.ainvoke(msgs)
         _record_usage(res)
+
+        # ★ Architect 直接调只读工具（读文件审查等）→ 跳过 delegation 解析
+        if res.tool_calls:
+            print(f"🔍 Architect tools: {[tc['name'] for tc in res.tool_calls]}")
+            return {
+                "messages": remove_updates + [res],
+                "current_role": ROLE_ARCHITECT,
+                "delegation": "",
+                "tool_call_count": 0,
+                "budget_exhausted": False,
+                "latest_tool_results": [],
+                "guard_retries": 0,
+            }
 
         content = (res.content or "").strip()
 
@@ -540,16 +561,29 @@ def build_graph(
 
         # 组装调用
         calls = []
-        for tc in last_msg.tool_calls:
+        blocked_indices = set()
+        is_architect = state.get("current_role") == ROLE_ARCHITECT
+        for i, tc in enumerate(last_msg.tool_calls):
             tool_name = tc["name"]
             tool_args = dict(tc.get("args", {}) or {})
+            # Architect 安全网：拦截非只读工具（即使模型幻觉）
+            if is_architect and tool_name not in ARCHITECT_READONLY_NAMES:
+                print(f"🚫 [Guard] Architect blocked from calling {tool_name}")
+                blocked_indices.add(i)
             calls.append((tool_name, tool_args))
 
         results = await invoker.invoke_many(calls, telemetry)
 
         tool_msgs = []
         tool_results = []
-        for tc, result in zip(last_msg.tool_calls, results):
+        for i, (tc, result) in enumerate(zip(last_msg.tool_calls, results)):
+            # Architect blocked tool → 返回错误消息而非执行
+            if i in blocked_indices:
+                blocked_msg = f"Access denied: Architect cannot call '{tc['name']}'. Delegate write/execute to Coder instead."
+                tool_msgs.append(ToolMessage(content=blocked_msg, tool_call_id=tc["id"]))
+                tool_results.append({"tool_name": tc["name"], "tool_args": dict(tc.get("args",{}) or {}), "content": blocked_msg, "success": False})
+                continue
+
             content = result.to_tool_message_content()
 
             # ★ 保留原有 token 截断（自愈建议一并计入长度）
@@ -620,9 +654,16 @@ def build_graph(
         delegation = state.get("delegation", "").strip()
         if getattr(last_msg, "name", "") == "SystemRuntime":
             return "architect"
+        if getattr(last_msg, "tool_calls", None):
+            return "hooked_tools"
         if delegation:
             return "coder"
         return END
+
+    def route_after_hooked_tools(state):
+        if state.get("current_role") == ROLE_ARCHITECT:
+            return "architect"
+        return "budget"
 
     def route_after_coder(state):
         last_msg = state["messages"][-1]
@@ -651,9 +692,9 @@ def build_graph(
     builder.add_node("budget", budget_node)
     builder.add_node("coder_report", coder_report_node)
     builder.set_entry_point("architect")
-    builder.add_conditional_edges("architect", route_after_architect, {"coder": "coder", "architect": "architect", END: END})
+    builder.add_conditional_edges("architect", route_after_architect, {"coder": "coder", "hooked_tools": "hooked_tools", "architect": "architect", END: END})
     builder.add_conditional_edges("coder", route_after_coder, {"hooked_tools": "hooked_tools", "architect": "architect", END: END})
-    builder.add_edge("hooked_tools", "budget")
+    builder.add_conditional_edges("hooked_tools", route_after_hooked_tools, {"architect": "architect", "budget": "budget"})
     builder.add_conditional_edges("budget", route_after_budget, {"coder_report": "coder_report"})
     builder.add_conditional_edges("coder_report", route_after_coder_report, {"coder_report": "coder_report", "architect": "architect"})
     return builder.compile(checkpointer=MemorySaver())
