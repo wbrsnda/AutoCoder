@@ -112,9 +112,58 @@ async def create_mcp_tools(session):
         res = await session.call_tool("delete_file", arguments={"file_path": file_path})
         return res.content[0].text
 
+    @tool
+    async def mcp_write_files(files: list[dict]) -> str:
+        """Batch create/overwrite multiple files. files=[{"file_path":"a.py","content":"..."}]"""
+        res = await session.call_tool("write_files", arguments={"files": files})
+        return res.content[0].text
+
+    # ── Batch 1: Project development tools ──
+
+    @tool
+    async def mcp_find_files(pattern: str = "*.*", directory: str = ".", max_depth: int = None) -> str:
+        """Find files by glob pattern. Use this to discover project structure."""
+        args = {"pattern": pattern, "directory": directory}
+        if max_depth is not None:
+            args["max_depth"] = max_depth
+        res = await session.call_tool("find_files", arguments=args)
+        return res.content[0].text
+
+    @tool
+    async def mcp_create_directory(path: str) -> str:
+        """Create a directory (and parent dirs if needed)."""
+        res = await session.call_tool("create_directory", arguments={"path": path})
+        return res.content[0].text
+
+    @tool
+    async def mcp_move_file(source: str, destination: str) -> str:
+        """Move or rename a file/directory within the workspace."""
+        res = await session.call_tool("move_file", arguments={"source": source, "destination": destination})
+        return res.content[0].text
+
+    @tool
+    async def mcp_move_files(sources: list[str], destination_dir: str) -> str:
+        """Batch move multiple files into a target directory."""
+        res = await session.call_tool("move_files", arguments={"sources": sources, "destination_dir": destination_dir})
+        return res.content[0].text
+
+    @tool
+    async def mcp_git_status() -> str:
+        """Show the working tree status (staged, unstaged, untracked changes)."""
+        res = await session.call_tool("git_status", arguments={})
+        return res.content[0].text
+
+    @tool
+    async def mcp_git_diff(file_path: str = "", staged: bool = False) -> str:
+        """Show git diff for a file or all changes."""
+        res = await session.call_tool("git_diff", arguments={"file_path": file_path, "staged": staged})
+        return res.content[0].text
+
     return [
         mcp_list_dir, mcp_read_file, mcp_search_files, mcp_execute_bash,
-        mcp_write_file, mcp_append_file, mcp_apply_patch, mcp_delete_file,
+        mcp_write_file, mcp_append_file, mcp_apply_patch, mcp_delete_file, mcp_write_files,
+        mcp_find_files, mcp_create_directory, mcp_move_file, mcp_move_files,
+        mcp_git_status, mcp_git_diff,
     ]
 
 

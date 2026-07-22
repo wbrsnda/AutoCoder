@@ -242,5 +242,289 @@ def delete_file(file_path: str) -> str:
         return f"Error: {e}"
 
 
+@mcp.tool()
+def write_files(files: list[dict]) -> str:
+    """
+    Batch create/overwrite multiple files at once.
+    Args:
+        files: List of {"file_path": "...", "content": "..."} dicts
+    Returns per-file results.
+    """
+    write_err = _check_write_permission()
+    if write_err:
+        return write_err
+    if not files:
+        return "Error: files list is empty"
+
+    ok, fail = [], []
+    for entry in files:
+        fp = entry.get("file_path", "")
+        content = entry.get("content", "")
+        if not fp:
+            fail.append(f"  FAIL  missing file_path: {entry}")
+            continue
+        try:
+            target = _resolve(fp)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            ok.append(f"  OK    {fp} ({len(content)} bytes)")
+        except Exception as e:
+            fail.append(f"  FAIL  {fp}: {e}")
+
+    return f"Batch write: {len(ok)} ok, {len(fail)} failed\n" + "\n".join(ok + fail)
+
+
+# ═══════════════════════════════════════════════════════
+# Batch 1: Project development tools
+# ═══════════════════════════════════════════════════════
+
+@mcp.tool()
+def find_files(pattern: str = "*.*", directory: str = ".", max_depth: int = None) -> str:
+    """
+    Find files by glob pattern (e.g. '*.py', 'test_*.py', '**/*.json').
+    Use this instead of list_dir when you need to search recursively or filter by name.
+    Args:
+        pattern: Glob pattern (supports ** for recursive matching). Default: "*.*"
+        directory: Starting directory. Default: "." (workspace root)
+        max_depth: Optional max directory depth (None = unlimited)
+    """
+    try:
+        target = _resolve(directory)
+        if not target.exists():
+            return f"Error: Directory not found: {directory}"
+        if not target.is_dir():
+            return f"Error: {directory} is not a directory"
+
+        matches = []
+        if max_depth is not None and max_depth < 0:
+            return "Error: max_depth must be >= 0 or None"
+
+        for p in sorted(target.rglob(pattern)):
+            if not p.is_file():
+                continue
+            if any(part.startswith('.') for part in p.parts if part not in ('.', '..')):
+                continue
+            if any(part in ('node_modules', '__pycache__', 'venv', '.git') for part in p.parts):
+                continue
+            rel = p.relative_to(target)
+            depth = len(rel.parts) - 1
+            if max_depth is not None and depth > max_depth:
+                continue
+            size = p.stat().st_size
+            matches.append((str(rel).replace("\\", "/"), size))
+
+        if not matches:
+            return f"No files matching '{pattern}' found in {directory}"
+
+        lines = [f"Found {len(matches)} file(s) matching '{pattern}' in {directory}:"]
+        for rel_path, size in matches[:100]:
+            if size < 1024:
+                size_str = f"{size}B"
+            elif size < 1024 * 1024:
+                size_str = f"{size / 1024:.1f}KB"
+            else:
+                size_str = f"{size / (1024 * 1024):.1f}MB"
+            lines.append(f"  {rel_path} ({size_str})")
+
+        if len(matches) > 100:
+            lines.append(f"  ... (+{len(matches) - 100} more files, use a more specific pattern)")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def create_directory(path: str) -> str:
+    """
+    Create a directory (and any missing parent directories).
+    Safe: does nothing if directory already exists.
+    """
+    write_err = _check_write_permission()
+    if write_err:
+        return write_err
+    try:
+        target = _resolve(path)
+        existed = target.exists()
+        target.mkdir(parents=True, exist_ok=True)
+        verb = "Already exists" if existed else "Created"
+        return f"Success: {verb} directory: {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def move_file(source: str, destination: str) -> str:
+    """
+    Move or rename a file/directory within the workspace.
+    Both source and destination must be within workspace boundaries.
+    """
+    write_err = _check_write_permission()
+    if write_err:
+        return write_err
+    try:
+        src = _resolve(source)
+        dst = _resolve(destination)
+
+        if not src.exists():
+            return f"Error: Source not found: {source}"
+
+        # 如果目标目录不存在，自动创建
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        src.rename(dst)
+        return f"Success: Moved '{source}' → '{destination}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def move_files(sources: list[str], destination_dir: str) -> str:
+    """
+    Batch move multiple files into a target directory.
+    Args:
+        sources: List of file paths to move
+        destination_dir: Target directory (created if missing)
+    Returns a summary with per-file results.
+    """
+    write_err = _check_write_permission()
+    if write_err:
+        return write_err
+    if not sources:
+        return "Error: sources list is empty"
+
+    try:
+        dst_dir = _resolve(destination_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+        ok, fail, skipped = [], [], []
+        for src_path in sources:
+            try:
+                src = _resolve(src_path)
+                if not src.exists():
+                    fail.append(f"  FAIL  {src_path}: not found")
+                    continue
+                dst = dst_dir / src.name
+                if dst.exists():
+                    skipped.append(f"  SKIP  {src_path}: already exists at {destination_dir}/{src.name}")
+                    continue
+                src.rename(dst)
+                ok.append(f"  OK    {src_path} → {destination_dir}/{src.name}")
+            except Exception as e:
+                fail.append(f"  FAIL  {src_path}: {e}")
+
+        parts = [f"Batch move: {len(ok)} ok, {len(fail)} failed, {len(skipped)} skipped"]
+        parts.extend(ok)
+        parts.extend(fail)
+        parts.extend(skipped)
+        return "\n".join(parts)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def git_status() -> str:
+    """
+    Show the working tree status (git status --short).
+    Returns a human-readable summary of staged, unstaged, and untracked changes.
+    """
+    if not (WORKSPACE_DIR / ".git").exists():
+        return "Not a git repository. Use 'git init' in the workspace to initialize one."
+
+    try:
+        result = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=str(WORKSPACE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return (
+                f"Git error (exit code {result.returncode}):\n"
+                f"{result.stderr.strip()[:500]}\n\n"
+                f"Hint: Ensure the workspace is a git repository (git init)."
+            )
+
+        output = result.stdout.strip()
+        if not output:
+            return "Working tree clean. No changes to commit."
+
+        lines = output.split("\n")
+        staged = [l for l in lines if l[0] != " "]
+        unstaged = [l for l in lines if l[0] == " " and l[1] != "?"]
+        untracked = [l for l in lines if l.startswith("??")]
+
+        parts = ["### Git Status"]
+        if staged:
+            parts.append(f"\nStaged for commit ({len(staged)}):")
+            parts.extend(f"  {l}" for l in staged[:30])
+        if unstaged:
+            parts.append(f"\nModified (not staged) ({len(unstaged)}):")
+            parts.extend(f"  {l}" for l in unstaged[:30])
+        if untracked:
+            parts.append(f"\nUntracked ({len(untracked)}):")
+            parts.extend(f"  {l}" for l in untracked[:30])
+
+        total = len(lines)
+        if total > 30:
+            parts.append(f"\n... ({total - 30} more entries, showing first 30)")
+        return "\n".join(parts)
+    except FileNotFoundError:
+        return "Error: git is not installed or not available on PATH."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def git_diff(file_path: str = "", staged: bool = False) -> str:
+    """
+    Show git diff for a specific file or all changed files.
+    Args:
+        file_path: Optional path to diff (leave empty for all changes)
+        staged: If True, show staged changes (git diff --staged). Default: False (unstaged)
+    """
+    if not (WORKSPACE_DIR / ".git").exists():
+        return "Not a git repository. Use 'git init' in the workspace to initialize one."
+
+    try:
+        args = ["git", "diff"]
+        if staged:
+            args.append("--staged")
+        if file_path:
+            args.append("--")
+            args.append(file_path)
+
+        result = subprocess.run(
+            args,
+            cwd=str(WORKSPACE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode != 0:
+            return (
+                f"Git diff error (exit code {result.returncode}):\n"
+                f"{result.stderr.strip()[:500]}\n\n"
+                f"Hint: Ensure the workspace is a git repository."
+            )
+
+        output = result.stdout.strip()
+        if not output:
+            scope = file_path if file_path else "working tree"
+            kind = "staged" if staged else "unstaged"
+            return f"No {kind} changes in {scope}."
+
+        # 限制输出长度，避免 token 爆炸
+        if len(output) > 8000:
+            output = output[:8000] + "\n\n[...diff truncated to 8000 chars]"
+        return output
+    except FileNotFoundError:
+        return "Error: git is not installed or not available on PATH."
+    except Exception as e:
+        return f"Error: {e}"
+
+
 if __name__ == "__main__":
     mcp.run(transport='stdio')

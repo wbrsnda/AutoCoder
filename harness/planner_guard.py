@@ -247,6 +247,12 @@ class PlannerGuard:
             directory = self._extract_kwarg(text, ["directory", "dir", "path"]) or "."
             return self._tool_call("mcp_list_dir", {"directory": directory})
 
+        # mcp_find_files
+        if "mcp_find_files" in low:
+            pattern = self._extract_kwarg(text, ["pattern"]) or "*.*"
+            directory = self._extract_kwarg(text, ["directory", "dir"]) or "."
+            return self._tool_call("mcp_find_files", {"pattern": pattern, "directory": directory})
+
         # mcp_read_file
         if "mcp_read_file" in low:
             fp = (
@@ -288,17 +294,51 @@ class PlannerGuard:
             if fp:
                 return self._tool_call("mcp_delete_file", {"file_path": fp})
 
-        # ★ 新增：mcp_write_file / mcp_append_file
-        # Architect 通常输出：Use mcp_write_file to create X.py with the following content:\n```lang\n<code>\n```
+        # mcp_move_file
+        if "mcp_move_file" in low:
+            source = self._extract_kwarg(text, ["source", "src", "from"])
+            dest = self._extract_kwarg(text, ["destination", "dest", "dst", "to"])
+            if source and dest:
+                return self._tool_call("mcp_move_file", {"source": source, "destination": dest})
+
+        # mcp_move_files (batch) — sources from list-like text
+        if "mcp_move_files" in low:
+            dest_dir = self._extract_kwarg(text, ["destination_dir", "dest_dir", "to", "directory"]) or "."
+            # extract sources: all quoted strings that are NOT destination_dir value
+            all_quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', text)
+            all_quoted = [s[0] or s[1] for s in all_quoted if s[0] or s[1]]
+            sources = [s for s in all_quoted if s != dest_dir and not s.endswith("/" + dest_dir) and dest_dir not in (s,)]
+            if sources:
+                return self._tool_call("mcp_move_files", {"sources": sources, "destination_dir": dest_dir})
+            return None  # let Coder LLM handle fuzzy extraction
+
+        # mcp_create_directory
+        if "mcp_create_directory" in low:
+            path = self._extract_kwarg(text, ["path", "directory", "dir"])
+            if path:
+                return self._tool_call("mcp_create_directory", {"path": path})
+
+        # git tools (always delegate to Coder LLM — no deterministic path needed)
+        # git_status and git_diff are simple enough to recognize by name
+        if "mcp_git_status" in low:
+            return self._tool_call("mcp_git_status", {})
+        if "mcp_git_diff" in low:
+            fp = self._extract_kwarg(text, ["file_path", "path", "file"]) or ""
+            staged = "staged" in low
+            return self._tool_call("mcp_git_diff", {"file_path": fp, "staged": staged})
+
+        # mcp_write_file / mcp_append_file — extract file_path from delegation text
         if "mcp_write_file" in low or "mcp_append_file" in low:
             tool = "mcp_write_file" if "mcp_write_file" in low else "mcp_append_file"
             fp = self._extract_write_target(text)
             content = self._extract_code_block(text)
-            # 允许 content 为空字符串（写空文件），但不允许 None
             if fp and content is not None:
                 return self._tool_call(tool, {"file_path": fp, "content": content})
-            # 有文件名但没代码块 → 退给 Coder LLM 处理
             return None
+
+        # mcp_write_files (batch) — multi-file write
+        if "mcp_write_files" in low:
+            return None  # delegation contains full file specs; let Coder LLM handle
 
         return None
 

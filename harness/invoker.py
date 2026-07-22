@@ -318,6 +318,31 @@ class ToolInvoker:
         elif tool_name == "mcp_delete_file" and fp:
             self.file_tracker.record_file_deleted(fp)
 
+        elif tool_name == "mcp_write_files" and success:
+            for entry in args.get("files", []):
+                fpath = entry.get("file_path", "")
+                if fpath:
+                    self.file_tracker.record_file_modified(fpath)
+
+        elif tool_name == "mcp_move_file" and success:
+            src = args.get("source", "")
+            dst = args.get("destination", "")
+            if src:
+                self.file_tracker.record_file_deleted(src)
+            if dst:
+                self.file_tracker.record_file_modified(dst)
+
+        elif tool_name == "mcp_move_files" and success:
+            for src in args.get("sources", []):
+                if src:
+                    self.file_tracker.record_file_deleted(src)
+            dst_dir = args.get("destination_dir", "")
+            if dst_dir:
+                self.file_tracker.record_file_modified(dst_dir)
+
+        elif tool_name == "mcp_create_directory":
+            pass  # 目录创建不影响文件跟踪状态
+
     @staticmethod
     def _is_retryable(error: str) -> bool:
         low = error.lower()

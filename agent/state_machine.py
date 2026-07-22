@@ -154,10 +154,32 @@ def _build_deterministic_report(delegation: str, latest_tool_results: list) -> s
             files_modified.append(fp)
             verb = "写入" if tool_name == "mcp_write_file" else "追加"
             body.append(f"### {verb}文件结果\n- 目标: {fp}\n- 工具返回: {content}")
+        elif tool_name == "mcp_write_files":
+            count = len(tool_args.get("files", []))
+            paths = [e.get("file_path","?") for e in tool_args.get("files", [])[:5]]
+            files_modified.extend(paths)
+            body.append(f"### 批量写入结果\n- {count} 个文件: {', '.join(paths)}\n- 工具返回:\n{content[:1000]}")
         elif tool_name == "mcp_apply_patch":
             fp = tool_args.get("file_path", "unknown")
             files_modified.append(fp)
             body.append(f"### Patch 结果\n- 目标: {fp}\n- 工具返回: {content}")
+        elif tool_name == "mcp_move_file":
+            src = tool_args.get("source", "unknown")
+            dst = tool_args.get("destination", "unknown")
+            files_modified.append(dst)
+            body.append(f"### 移动文件结果\n- 源: {src}\n- 目标: {dst}\n- 工具返回: {content}")
+        elif tool_name == "mcp_move_files":
+            count = len(tool_args.get("sources", []))
+            dst_dir = tool_args.get("destination_dir", "unknown")
+            files_modified.append(dst_dir)
+            body.append(f"### 批量移动结果\n- {count} 个文件 → {dst_dir}\n- 工具返回:\n{content[:2000]}")
+        elif tool_name == "mcp_create_directory":
+            path = tool_args.get("path", "unknown")
+            body.append(f"### 创建目录结果\n- 路径: {path}\n- 工具返回: {content}")
+        elif tool_name == "mcp_find_files":
+            body.append(f"### 文件搜索结果\n- 模式: {tool_args.get('pattern', '*.*')}\n- 结果:\n{content[:2000]}")
+        elif tool_name in ("mcp_git_status", "mcp_git_diff"):
+            body.append(f"### Git 结果\n- Tool: {tool_name}\n- Output:\n{content[:2000]}")
         elif tool_name in ("memories_search", "memories_read", "memories_list", "add_ad_hoc_note"):
             body.append(f"### Memory 结果\n- Tool: {tool_name}\n- Args: {tool_args}\n- Output:\n{content[:3000]}")
         else:
@@ -465,11 +487,11 @@ def build_graph(
             sys_content += "\n" + context_summary
 
         sys_content += (
-            "\n\n[PHASE]: TOOL EXECUTION PHASE.\n"
-            "Your job is to call the required tool(s). Match the tool name in the task.\n"
-            "If task says memories_search, call memories_search (NOT mcp_search_files).\n"
-            "Prefer mcp_append_file over mcp_write_file when the user asks to 'append' or extend a file.\n"
-            "Call exactly one tool. Do not explain after deciding."
+            "\n\n[PHASE]: IMPLEMENTATION PHASE.\n"
+            "Read the Architect's task specification above. Write complete, working code.\n"
+            "You have full access to discovery, write, and execution tools.\n"
+            "Prefer mcp_write_files to create multiple files in ONE call.\n"
+            "Do NOT just explain — produce actual file content and call the tools."
         )
 
         clean = [m for m in prompt_msgs if not isinstance(m, SystemMessage)]
@@ -516,13 +538,11 @@ def build_graph(
         turn_id = state.get("turn_id", "") or _get_ctx().turn_id
         telemetry = _get_telemetry(turn_id)
 
-        # 组装调用（保留原有的 file_path 兜底行为）
+        # 组装调用
         calls = []
         for tc in last_msg.tool_calls:
             tool_name = tc["name"]
             tool_args = dict(tc.get("args", {}) or {})
-            if tool_name in ("mcp_write_file", "mcp_append_file") and "file_path" not in tool_args:
-                tool_args["file_path"] = "new_script.py"
             calls.append((tool_name, tool_args))
 
         results = await invoker.invoke_many(calls, telemetry)

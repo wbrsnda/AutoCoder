@@ -10,11 +10,18 @@ TOOL_TAGS = {
     "mcp_list_dir": {"read", "discovery"},
     "mcp_read_file": {"read", "discovery"},
     "mcp_search_files": {"read", "discovery"},
+    "mcp_find_files": {"read", "discovery"},
+    "mcp_git_status": {"read", "git"},
+    "mcp_git_diff": {"read", "git"},
 
     "mcp_write_file": {"write", "edit"},
     "mcp_append_file": {"write", "edit"},
     "mcp_apply_patch": {"write", "edit"},
     "mcp_delete_file": {"write", "destructive"},
+    "mcp_write_files": {"write", "edit"},
+    "mcp_create_directory": {"write"},
+    "mcp_move_file": {"write"},
+    "mcp_move_files": {"write"},
 
     "mcp_execute_bash": {"execute"},
 
@@ -78,6 +85,8 @@ class ContextGateway:
 
         if re.search(r"read|list|explore|find|search|check|show|inspect|列|读|看|查|找", d):
             wanted_tags.update({"read", "discovery"})
+        if re.search(r"git|commit|diff|status|branch|提交|版本", d):
+            wanted_tags.update({"git"})
         if re.search(r"write|create|edit|modify|patch|append|update|add|写|改|建|创建|追加|修改", d):
             wanted_tags.update({"write", "edit"})
         if re.search(r"delete|remove|clean|删", d):
