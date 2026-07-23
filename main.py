@@ -11,7 +11,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from contextlib import AsyncExitStack
 
-load_dotenv()
+# 显式加载 autocoder/ 目录下的 .env
+_ENV_PATH = Path(__file__).parent / ".env"
+load_dotenv(_ENV_PATH)
 
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession

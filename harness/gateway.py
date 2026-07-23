@@ -95,7 +95,7 @@ class ContextGateway:
             wanted_tags.update({"execute", "read"})
         if re.search(r"memor|记忆|记住|note", d):
             wanted_tags.update({"memory"})
-        if re.search(r"web|documentation|docs|资料|文档|api reference", d):
+        if re.search(r"web|documentation|docs|资料|文档|api reference|search|查询|搜索|查找|不确定|不知道|查一下", d):
             wanted_tags.update({"web"})
 
         if not wanted_tags:

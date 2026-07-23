@@ -34,6 +34,34 @@ class PlannerGuard:
         re.IGNORECASE,
     )
 
+    # ★★★ Web Search 自主触发检测 ★★★
+    # 仅当用户任务涉及具体库/框架/API 时才强制先搜索
+    SEARCH_TRIGGER_RE = re.compile(
+        r"\b(flask|django|fastapi|sqlalchemy|pandas|numpy|scipy|matplotlib|"
+        r"seaborn|sklearn|scikit|tensorflow|pytorch|keras|transformers|huggingface|"
+        r"langchain|langgraph|chromadb|pinecone|weaviate|openai|anthropic|ollama|"
+        r"react|vue|angular|svelte|next\.?js|nuxt|express|koa|hapi|"
+        r"docker|kubernetes|k8s|terraform|ansible|pulumi|"
+        r"redis|mongodb|postgresql|mysql|sqlite|elasticsearch|kafka|rabbitmq|"
+        r"aws|azure|gcp|cloudflare|vercel|netlify|heroku|"
+        r"tailwind|bootstrap|sass|less|webpack|vite|esbuild|"
+        r"electron|tauri|flutter|react.native|expo|"
+        r"pytest|jest|mocha|cypress|selenium|playwright|"
+        r"grpc|graphql|rest.api|websocket|socket\.io|"
+        r"celery|rabbitmq|redis|memcached|"
+        r"jwt|oauth|openid|saml|ldap|"
+        r"pydantic|marshmallow|cerberus|"
+        r"polars|dask|ray|spark|hadoop|"
+        r"opencv|pillow|ffmpeg|"
+        r"nltk|spacy|gensim|textblob|"
+        r"gitlab|jenkins|github.actions|circleci|travis|"
+        r"prometheus|grafana|datadog|sentry|"
+        r"airflow|prefect|dagster|luigi|"
+        r"mcp|fastmcp|model.context.protocol"
+        r")\b",
+        re.IGNORECASE,
+    )
+
     WORKSPACE_LIST_RE = re.compile(
         r"("
         r"当前工作目录|工作目录|workspace|目录下|项目里|有什么文件|有哪些文件|"
@@ -97,6 +125,16 @@ class PlannerGuard:
         # 破坏性请求不自动 delegate，必须走 Architect 确认流程
         if self.DESTRUCTIVE_RE.search(text):
             return None
+
+        # ★★★ 自主搜索触发：涉及不熟悉的库/框架/API，强制先搜索 ★★★
+        if self.SEARCH_TRIGGER_RE.search(text) and self._tool_available("rag_search"):
+            query = self._extract_search_query(text)
+            return DelegationPlan(
+                instruction=f'Use rag_search query="{query}" to research this task.',
+                tool_name="rag_search",
+                args={"query": query},
+                reason="User task involves unfamiliar library/framework/API. Search first to avoid incorrect code.",
+            )
 
         # 1. 当前工作目录 / workspace 有什么文件
         if self.WORKSPACE_LIST_RE.search(text) and self.LIST_INTENT_RE.search(text):
@@ -272,6 +310,16 @@ class PlannerGuard:
                     {"regex": regex, "file_pattern": file_pattern},
                 )
 
+        # rag_search — web search
+        if "rag_search" in low:
+            query = self._extract_kwarg(text, ["query", "q"])
+            if not query:
+                # Extract the text after "rag_search" as the query
+                idx = low.find("rag_search")
+                after = text[idx + len("rag_search"):].strip().lstrip(": ").strip("\"'")
+                query = after[:200] if after else text[:200]
+            return self._tool_call("rag_search", {"query": query})
+
         # memories_search / memories_read / memories_list
         if "memories_search" in low:
             query = self._extract_kwarg(text, ["query", "q"])
@@ -337,8 +385,24 @@ class PlannerGuard:
             return None
 
         # mcp_write_files (batch) — multi-file write
+        # 留给 Coder LLM 生成实际内容，确定性路径不写空文件
         if "mcp_write_files" in low:
-            return None  # delegation contains full file specs; let Coder LLM handle
+            return None
+
+        # ── 语义匹配：中文 delegation 不含工具名时，根据语义推断 ──
+        # 只处理不需要内容的操作（创建目录）。文件写入必须有实际代码，
+        # 让 Coder LLM 来生成内容，确定性路径不生成空文件。
+
+        # "创建一个名为 X 的目录" / "创建 X 目录"
+        dir_match = re.search(
+            r'(?:创建|新建|mkdir|make\s+dir)(?:一个)?(?:名为|叫)?\s*[`"\']?'
+            r'([A-Za-z0-9_\-./]+)'
+            r'[`"\']?\s*(?:的?\s*)?(?:目录|文件夹|项目目录|project\s*directory)',
+            text, re.I,
+        )
+        if dir_match and self._tool_available("mcp_create_directory"):
+            path = dir_match.group(1)
+            return self._tool_call("mcp_create_directory", {"path": path})
 
         return None
 
@@ -364,6 +428,16 @@ class PlannerGuard:
         if path.startswith("./"):
             path = path[2:]
         return path.replace("\\", "/")
+
+    def _extract_search_query(self, text: str) -> str:
+        """从用户请求中提取一个好的搜索查询词。"""
+        # 去除常见的口语前缀，保留核心技术关键词
+        cleaned = re.sub(
+            r"(帮我|帮我写|写一个|创建一个|做一个|开发|请|麻烦|可以|能不能|如何|怎么)",
+            "", text, flags=re.IGNORECASE,
+        )
+        # 只取前 150 个字符作为搜索查询
+        return cleaned.strip()[:150]
 
     def _extract_quoted_path(self, text: str) -> Optional[str]:
         m = re.search(r'["\']([^"\']+\.[A-Za-z0-9]+)["\']', text)

@@ -41,6 +41,7 @@ class AgentState(TypedDict):
     budget_exhausted: bool
     latest_tool_results: list
     guard_retries: int
+    coder_retries: int
     turn_id: str
 
 
@@ -115,15 +116,16 @@ def _summarize_python_file(file_path: str, content: str) -> str:
 def _summarize_text_file(file_path: str, content: str) -> str:
     source = _strip_line_numbers(content)
     lines = [line for line in source.splitlines() if line.strip()]
-    preview = "\n".join(lines[:20])
-    return f"### 文件分析: {file_path}\n- 这是一个文本文件。\n- 前 20 行预览:\n{preview}"
+    count = len(lines)
+    preview = "\n".join(lines[:5])  # 只取前 5 行
+    return f"### {file_path} ({count} lines)\n```\n{preview}\n```"
 
 
 def _build_deterministic_report(delegation: str, latest_tool_results: list) -> str:
     if not latest_tool_results:
-        return f"REPORT TO ARCHITECT:\n- **Task**: {delegation}\n- **Status**: Failed\n- **Issues Found**: No tool results."
+        return f"REPORT TO ARCHITECT:\n- **Task**: {delegation[:200]}\n- **Status**: Failed\n- **Issues Found**: No tool results."
 
-    parts = ["REPORT TO ARCHITECT:", f"- **Task**: {delegation}", "- **Status**: Complete"]
+    parts = ["REPORT TO ARCHITECT:", f"- **Task**: {delegation[:200]}", "- **Status**: Complete"]
     files_read, files_modified, issues, body = [], [], [], []
 
     for item in latest_tool_results:
@@ -153,7 +155,7 @@ def _build_deterministic_report(delegation: str, latest_tool_results: list) -> s
             fp = tool_args.get("file_path", "unknown")
             files_modified.append(fp)
             verb = "写入" if tool_name == "mcp_write_file" else "追加"
-            body.append(f"### {verb}文件结果\n- 目标: {fp}\n- 工具返回: {content}")
+            body.append(f"### {verb}文件结果\n- 目标: {fp}\n- {content[:80]}")
         elif tool_name == "mcp_write_files":
             count = len(tool_args.get("files", []))
             paths = [e.get("file_path","?") for e in tool_args.get("files", [])[:5]]
@@ -491,7 +493,7 @@ def build_graph(
 
         # ★ Gateway 按需选择工具
         visible_tools = gateway.select_for_delegation(delegation)
-        coder_bound_dyn = coder_llm.bind_tools(visible_tools)
+        coder_bound_dyn = coder_llm.bind_tools(visible_tools, tool_choice="required")
         visible_manifest = gateway.build_visible_manifest(visible_tools)
 
         if len(visible_tools) < len(all_tools):
@@ -541,6 +543,19 @@ def build_graph(
         if res.tool_calls:
             print(f"🛠️  Tools: {[tc['name'] for tc in res.tool_calls]}")
         else:
+            # 给 Coder 一次重试机会，注入强制指令
+            coder_retries = state.get("coder_retries", 0)
+            if coder_retries < 1 and delegation:
+                print(f"🔄 [CoderGuard] Retrying Coder with force instruction (attempt {coder_retries + 1})...")
+                force_msg = HumanMessage(
+                    content=f"⚠️ You MUST call the tool NOW. Do not describe, do not explain. The delegation says: {delegation[:200]}. Call the tool immediately.",
+                    name="SystemRuntime",
+                )
+                return {
+                    "messages": remove_updates + [res, force_msg],
+                    "current_role": ROLE_CODER,
+                    "coder_retries": coder_retries + 1,
+                }
             print("⚠️  [CoderGuard] Coder returned no tool_calls AND no fallback matched. Routing back to Architect.")
 
         return {
